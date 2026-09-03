@@ -24,6 +24,7 @@
 #include <stdbool.h>
 #include <stdint.h>
 #include <stdio.h>
+#include <stdlib.h>
 #include <string.h>
 #include <sys/mman.h>
 #include <unistd.h>
@@ -678,6 +679,36 @@ static void probe_api(void *domain, void *aec,
        TouchScreenKeyboard is the mobile-native way in and is better UX anyway. */
     log_methods("TouchScreenKeyboard",
                 class_from_name(core_image, "UnityEngine", "TouchScreenKeyboard"), NULL);
+
+    /* Wall-aware movement needs exact overload signatures before committing
+       to a disambiguation rule - Unity ships several Raycast/OverlapCircle
+       overloads (ContactFilter2D-based ones included), and guessing which
+       one find_method's (argc, param_index, type substring) match lands on
+       is exactly the kind of thing that goes wrong silently. Dump the real
+       ones this build has. */
+    void *phys2d = assembly_open(domain, "UnityEngine.Physics2DModule");
+    if (phys2d != NULL) {
+        void *p2d_image = assembly_image(phys2d);
+        log_methods("Physics2D", class_from_name(p2d_image, "UnityEngine", "Physics2D"),
+                    "Raycast");
+        log_methods("Physics2D", class_from_name(p2d_image, "UnityEngine", "Physics2D"),
+                    "Overlap");
+        log_methods("Physics2D", class_from_name(p2d_image, "UnityEngine", "Physics2D"),
+                    "Cast");
+        log_methods("BoxCollider2D",
+                    class_from_name(p2d_image, "UnityEngine", "BoxCollider2D"), NULL);
+        log_methods("Collider2D", class_from_name(p2d_image, "UnityEngine", "Collider2D"),
+                    "ounds");
+        log_methods("RaycastHit2D", class_from_name(p2d_image, "UnityEngine", "RaycastHit2D"),
+                    NULL);
+    } else {
+        LOGE("api probe: UnityEngine.Physics2DModule not found");
+    }
+    log_methods("LayerMask", class_from_name(core_image, "UnityEngine", "LayerMask"), NULL);
+    log_methods("Transform", class_from_name(core_image, "UnityEngine", "Transform"),
+                "TransformPoint");
+    log_methods("Transform", class_from_name(core_image, "UnityEngine", "Transform"),
+                "ossyScale");
 }
 
 /* -------------------------------------------------------------------------
@@ -754,6 +785,19 @@ static int g_kb_target;    /* which buffer the open keyboard writes into */
 #define KB_CMD 0
 #define KB_SPOOF 1
 #define KB_TITLE 2
+#define KB_QUEST 3
+
+/* Quest-farm state shared between the keyboard (quest ID entry) and
+   quest_tick() further down, which does the actual accept/hunt/turn-in
+   work once bindings are resolved. */
+static int g_quest_farm;
+static char g_quest_id_text[12] = "";
+static int g_quest_id;
+static float g_next_quest_tick;
+static float g_next_getquests_request;
+static int g_quest_accept_sent;
+static int g_quest_turnin_sent;
+static char g_quest_status[80] = "idle";
 
 static float g_scale = 2.0f;
 static int g_menu_open;
@@ -868,15 +912,6 @@ static float g_max_engage_dist = 9.0f;  /* matches QuestRunner.MaxEngageDist */
    player - resolved once in setup_menu. */
 static void *g_get_main_player;
 
-/* Shared with probe_monsters() below, which does the actual resolution (it
-   runs first every tick - see hook_aec_update) and the same generic-
-   dictionary walk technique, just counting instead of picking a winner. */
-static void *g_area_currentarea_field;
-static void *g_area_monsters_field;
-static void *g_monster_reaction_field;
-static void *g_entity_get_name;           /* resolved on Monster - see probe_monsters */
-static void *g_entity_get_currentstate;   /* resolved on Entity - Monster doesn't override it */
-
 /* Local-space player/target position, as a 3-float unboxed struct - same
    unbox-a-boxed-return pattern already proven for KeyValuePair in
    probe_monsters. NULL on any failure (no GameObject yet, no Transform, …). */
@@ -898,6 +933,446 @@ static bool read_local_pos(void *entity, float out[3])
     out[2] = raw[2];
     return true;
 }
+
+/* -------------------------------------------------------------------------
+ * Wall-aware movement (native port of PathWalker.cs)
+ *
+ * A straight walkTo toward a distant point drags the character along every
+ * curved wall between here and there - the game's own charge-walk gives up
+ * on a Blocker collider (blockedMoveTimer) and just stops. The desktop fix
+ * is: raycast the direct line first (cheap, the common case in an open
+ * cell), and only when that is blocked, plan a route with A* over a coarse
+ * grid sampled from the Blocker layer, then string-pull down to the corner
+ * waypoints that matter and feed those to the same walkTo() hunting already
+ * uses.
+ *
+ * One substitution from the desktop version: PathWalker.cs samples each
+ * grid cell with Physics2D.OverlapCircle, which strip-engine-code removed
+ * entirely from this build (confirmed empty via probe_api - 0 methods).
+ * Physics2D.OverlapBox survived, and a small square footprint is a fine
+ * stand-in for a circular clearance check at grid resolution. Everything
+ * else - Raycast, RaycastHit2D.collider, Transform.TransformPoint,
+ * get_lossyScale, LayerMask.NameToLayer - is confirmed present on this
+ * build too (probe_api, run before any of this was written on top of it).
+ *
+ * Grid is smaller than the desktop's (80x80 vs 160x160, 1.0 vs 0.5 cell
+ * size) because each sampled cell costs one native->managed round trip
+ * through OverlapBox - the desktop pays that cost in-process, this shim
+ * pays it across the IL2CPP call boundary, so coarsening the grid trades a
+ * little precision for a lot fewer round trips. Static arrays sized to the
+ * cap rather than malloc, since this runs on Unity's main thread, on a
+ * timer, and a plan that would exceed the cap fails cleanly (falls back to
+ * a direct walk) the same way the desktop's own MaxGridCells check does.
+ * ---------------------------------------------------------------------- */
+static void *g_p2d_raycast;              /* Physics2D.Raycast(Vector2,Vector2,float,int)   */
+static void *g_p2d_overlapbox;           /* Physics2D.OverlapBox(Vector2,Vector2,float,int) */
+static void *g_raycasthit2d_get_collider;
+static void *g_transform_transformpoint; /* Transform.TransformPoint(Vector3) - local->world */
+static void *g_transform_get_lossyscale;
+static void *g_transform_get_parent;
+static int32_t g_blocker_mask = -1;      /* 1 << LayerMask.NameToLayer("Blocker") */
+
+#define PATH_CELL_SIZE 1.0f
+#define PATH_CLEARANCE 0.35f
+#define PATH_MARGIN 6.0f
+#define PATH_W 80
+#define PATH_H 80
+#define PATH_CELLS (PATH_W * PATH_H)
+#define PATH_MAX_WAYPOINTS 48
+#define PATH_WAYPOINT_REACHED 0.45f
+#define PATH_STALL_SEC 1.2f
+
+static bool g_path_blocked[PATH_CELLS];
+static float g_path_gscore[PATH_CELLS];
+static int32_t g_path_from[PATH_CELLS];   /* predecessor cell index, -1 = none */
+static uint8_t g_path_state[PATH_CELLS];  /* 0 unvisited, 1 open, 2 closed */
+
+static float g_path_waypoints[PATH_MAX_WAYPOINTS][3];
+static int g_path_count;
+static int g_path_idx;
+static int g_path_active;   /* currently following a planned route */
+static int g_path_replanned_once;
+static float g_path_issued_at;
+static float g_path_last_move_at;
+static float g_path_last_pos[3];
+static float g_path_goal[3];
+static int g_path_walk_issued;
+
+/* World-space player parent transform, cached per hunt_tick call - every
+   local<->world conversion below needs it, and it does not change mid-tick. */
+static void *path_player_parent(void *player_go)
+{
+    if (player_go == NULL || g_go_get_transform == NULL || g_transform_get_parent == NULL) {
+        return NULL;
+    }
+    void *tr = inv(g_go_get_transform, player_go, NULL);
+    return tr ? inv(g_transform_get_parent, tr, NULL) : NULL;
+}
+
+static bool path_to_world(void *parent, const float local[3], float world[3])
+{
+    if (parent == NULL || g_transform_transformpoint == NULL || !il2cpp_object_unbox) {
+        return false;
+    }
+    void *args[1] = {(void *)local};
+    void *boxed = inv(g_transform_transformpoint, parent, args);
+    float *raw = boxed ? (float *)il2cpp_object_unbox(boxed) : NULL;
+    if (raw == NULL) {
+        return false;
+    }
+    world[0] = raw[0];
+    world[1] = raw[1];
+    world[2] = raw[2];
+    return true;
+}
+
+/* Blocker-layer raycast between two WORLD points. True (clear) on any
+   resolution failure - the desktop's own LineClear does the same, since a
+   pathing feature failing open into "just walk straight" is a much smaller
+   problem than it silently refusing to move at all. */
+static bool path_line_clear_world(const float a[3], const float b[3])
+{
+    if (g_p2d_raycast == NULL || g_raycasthit2d_get_collider == NULL || g_blocker_mask < 0 ||
+        !il2cpp_object_unbox) {
+        return true;
+    }
+    float dx = b[0] - a[0], dy = b[1] - a[1];
+    float dist = sqrtf(dx * dx + dy * dy);
+    if (dist < 0.001f) {
+        return true;
+    }
+    float origin[2] = {a[0], a[1]};
+    float dir[2] = {dx / dist, dy / dist};
+    int32_t mask = g_blocker_mask;
+    void *args[4] = {origin, dir, &dist, &mask};
+    void *boxed_hit = inv(g_p2d_raycast, NULL, args);
+    void *hit_raw = boxed_hit ? il2cpp_object_unbox(boxed_hit) : NULL;
+    if (hit_raw == NULL) {
+        return true;
+    }
+    void *collider = inv(g_raycasthit2d_get_collider, hit_raw, NULL);
+    return collider == NULL;
+}
+
+static bool path_line_clear_local(void *parent, const float a[3], const float b[3])
+{
+    float wa[3], wb[3];
+    if (!path_to_world(parent, a, wa) || !path_to_world(parent, b, wb)) {
+        return true;
+    }
+    return path_line_clear_world(wa, wb);
+}
+
+/* Is a WORLD point inside a Blocker-layer collider? OverlapBox stands in for
+   the desktop's OverlapCircle (stripped from this build - see the module
+   comment above); a square footprint at grid resolution is a fine trade. */
+static bool path_is_blocked_world(const float point[3], float half_size)
+{
+    if (g_p2d_overlapbox == NULL || g_blocker_mask < 0) {
+        return false;
+    }
+    float p[2] = {point[0], point[1]};
+    float size[2] = {half_size * 2.0f, half_size * 2.0f};
+    float angle = 0.0f;
+    int32_t mask = g_blocker_mask;
+    void *args[4] = {p, size, &angle, &mask};
+    return inv(g_p2d_overlapbox, NULL, args) != NULL;
+}
+
+static int path_cell_index(int x, int y)
+{
+    return y * PATH_W + x;
+}
+
+/* 8-directional A* over a grid covering start+goal (+margin), string-pulled
+   down to the waypoints a straight raycast actually needs. Writes into
+   g_path_waypoints/g_path_count; returns false (no waypoints written) if the
+   grid is too big or genuinely unpathable - the caller falls back to a
+   direct walk either way, so "no path found" is a normal outcome, not an
+   error to surface. */
+static bool path_plan(void *parent, const float start_local[3], const float goal_local[3])
+{
+    g_path_count = 0;
+
+    float min_x = fminf(start_local[0], goal_local[0]) - PATH_MARGIN;
+    float max_x = fmaxf(start_local[0], goal_local[0]) + PATH_MARGIN;
+    float min_y = fminf(start_local[1], goal_local[1]) - PATH_MARGIN;
+    float max_y = fmaxf(start_local[1], goal_local[1]) + PATH_MARGIN;
+    int w = (int)ceilf((max_x - min_x) / PATH_CELL_SIZE);
+    int h = (int)ceilf((max_y - min_y) / PATH_CELL_SIZE);
+    if (w <= 0 || h <= 0 || w > PATH_W || h > PATH_H) {
+        return false;
+    }
+
+    float lossy_scale = 1.0f;
+    if (g_transform_get_lossyscale != NULL && il2cpp_object_unbox) {
+        void *boxed = inv(g_transform_get_lossyscale, parent, NULL);
+        float *raw = boxed ? (float *)il2cpp_object_unbox(boxed) : NULL;
+        if (raw != NULL) {
+            lossy_scale = raw[0];
+        }
+    }
+    float world_half = PATH_CLEARANCE * lossy_scale;
+
+    memset(g_path_blocked, 0, (size_t)(w * h) * sizeof(g_path_blocked[0]));
+    for (int gx = 0; gx < w; gx++) {
+        for (int gy = 0; gy < h; gy++) {
+            float local[3] = {min_x + (gx + 0.5f) * PATH_CELL_SIZE,
+                              min_y + (gy + 0.5f) * PATH_CELL_SIZE, start_local[2]};
+            float world[3];
+            bool blocked = true;
+            if (path_to_world(parent, local, world)) {
+                blocked = path_is_blocked_world(world, world_half);
+            }
+            g_path_blocked[path_cell_index(gx, gy)] = blocked;
+        }
+    }
+    int blocked_count = 0;
+    for (int i = 0; i < w * h; i++) {
+        if (g_path_blocked[i]) {
+            blocked_count++;
+        }
+    }
+
+    int sx = (int)((start_local[0] - min_x) / PATH_CELL_SIZE);
+    int sy = (int)((start_local[1] - min_y) / PATH_CELL_SIZE);
+    int gxg = (int)((goal_local[0] - min_x) / PATH_CELL_SIZE);
+    int gyg = (int)((goal_local[1] - min_y) / PATH_CELL_SIZE);
+    sx = sx < 0 ? 0 : (sx >= w ? w - 1 : sx);
+    sy = sy < 0 ? 0 : (sy >= h ? h - 1 : sy);
+    gxg = gxg < 0 ? 0 : (gxg >= w ? w - 1 : gxg);
+    gyg = gyg < 0 ? 0 : (gyg >= h ? h - 1 : gyg);
+
+    int start_idx = path_cell_index(sx, sy);
+    int goal_idx = path_cell_index(gxg, gyg);
+    LOGI("path: grid %dx%d (%d/%d blocked), start=(%d,%d) goal=(%d,%d)", w, h, blocked_count,
+         w * h, sx, sy, gxg, gyg);
+    if (g_path_blocked[start_idx] || g_path_blocked[goal_idx]) {
+        LOGI("path: start or goal cell itself is blocked - not our problem to fix");
+        return false;
+    }
+
+    memset(g_path_state, 0, (size_t)(w * h) * sizeof(g_path_state[0]));
+    for (int i = 0; i < w * h; i++) {
+        g_path_gscore[i] = 1e9f;
+        g_path_from[i] = -1;
+    }
+    g_path_gscore[start_idx] = 0.0f;
+    g_path_state[start_idx] = 1;
+
+    int dxs[8] = {1, -1, 0, 0, 1, 1, -1, -1};
+    int dys[8] = {0, 0, 1, -1, 1, -1, 1, -1};
+    bool found = false;
+    int guard = w * h * 9 + 16;
+
+    while (guard-- > 0) {
+        /* Linear-scan open list: grids here are small (typically well under
+           1000 cells for a hunt-range replan), so a real heap is not worth
+           the extra code - this is O(cells) per pop, not O(cells^2) overall
+           since each cell closes at most once. */
+        int best = -1;
+        float best_f = 0.0f;
+        for (int i = 0; i < w * h; i++) {
+            if (g_path_state[i] != 1) {
+                continue;
+            }
+            int cx = i % w, cy = i / w;
+            float hx = (float)(cx - gxg), hy = (float)(cy - gyg);
+            float f = g_path_gscore[i] + sqrtf(hx * hx + hy * hy);
+            if (best < 0 || f < best_f) {
+                best = i;
+                best_f = f;
+            }
+        }
+        if (best < 0) {
+            break; /* open set exhausted - unreachable */
+        }
+        if (best == goal_idx) {
+            found = true;
+            break;
+        }
+        g_path_state[best] = 2;
+        int bx = best % w, by = best / w;
+        for (int d = 0; d < 8; d++) {
+            int nx = bx + dxs[d], ny = by + dys[d];
+            if (nx < 0 || ny < 0 || nx >= w || ny >= h) {
+                continue;
+            }
+            int ni = path_cell_index(nx, ny);
+            if (g_path_blocked[ni] || g_path_state[ni] == 2) {
+                continue;
+            }
+            if (d >= 4 && (g_path_blocked[path_cell_index(bx, ny)] ||
+                          g_path_blocked[path_cell_index(nx, by)])) {
+                continue; /* no cutting a blocked corner diagonally */
+            }
+            float step = d >= 4 ? 1.41421f : 1.0f;
+            float ng = g_path_gscore[best] + step;
+            if (ng < g_path_gscore[ni]) {
+                g_path_gscore[ni] = ng;
+                g_path_from[ni] = best;
+                g_path_state[ni] = 1;
+            }
+        }
+    }
+    if (!found) {
+        LOGI("path: A* found no route - blocked grid or unreachable goal");
+        return false;
+    }
+
+    /* Rebuild the raw cell-center path, then string-pull: keep only the
+       corners a raycast from the current anchor cannot see past. */
+    float raw[PATH_MAX_WAYPOINTS][3];
+    int raw_count = 0;
+    int walk = goal_idx;
+    while (walk != start_idx && raw_count < PATH_MAX_WAYPOINTS - 1) {
+        int cx = walk % w, cy = walk / w;
+        raw[raw_count][0] = min_x + (cx + 0.5f) * PATH_CELL_SIZE;
+        raw[raw_count][1] = min_y + (cy + 0.5f) * PATH_CELL_SIZE;
+        raw[raw_count][2] = start_local[2];
+        raw_count++;
+        walk = g_path_from[walk];
+        if (walk < 0) {
+            return false; /* corrupt chain - fail safe rather than loop forever */
+        }
+    }
+    /* raw is goal->start order; reverse in place, then append the true goal
+       (the cell center is not exactly the target's actual position). */
+    for (int i = 0; i < raw_count / 2; i++) {
+        float tmp[3];
+        memcpy(tmp, raw[i], sizeof(tmp));
+        memcpy(raw[i], raw[raw_count - 1 - i], sizeof(tmp));
+        memcpy(raw[raw_count - 1 - i], tmp, sizeof(tmp));
+    }
+    if (raw_count < PATH_MAX_WAYPOINTS) {
+        memcpy(raw[raw_count], goal_local, sizeof(raw[raw_count]));
+        raw_count++;
+    }
+
+    float anchor[3];
+    memcpy(anchor, start_local, sizeof(anchor));
+    int k = 0;
+    while (k < raw_count && g_path_count < PATH_MAX_WAYPOINTS) {
+        int next = k;
+        for (int j = raw_count - 1; j > k; j--) {
+            if (path_line_clear_local(parent, anchor, raw[j])) {
+                next = j;
+                break;
+            }
+        }
+        memcpy(g_path_waypoints[g_path_count], raw[next], sizeof(g_path_waypoints[0]));
+        memcpy(anchor, raw[next], sizeof(anchor));
+        g_path_count++;
+        k = next + 1;
+    }
+    LOGI("path: planned %d waypoint(s) (%d raw cells, string-pulled)", g_path_count, raw_count);
+    return g_path_count > 0;
+}
+
+/* Drives an in-progress route: advances past reached waypoints (with the
+   same string-pull skip-ahead PathWalker.cs does, so the walk cuts corners
+   instead of visiting every grid cell), reissues walkTo when the current
+   waypoint changes, and replans once on a stall before giving up for this
+   attempt. Returns true while still navigating (caller should not also
+   issue a direct walkTo this tick); false once done, failed, or never
+   started, so the caller falls through to hunting's normal direct-engage
+   path.
+   done_out is set true only on "arrived" (path complete). */
+static bool path_tick(void *parent, void *emu, const float goal_local[3], float speed,
+                      bool *done_out)
+{
+    *done_out = false;
+    float now = inv_float(g_time_get_time, NULL, NULL);
+    float here[3];
+    if (!read_local_pos(inv(g_get_main_player, NULL, NULL), here)) {
+        return false;
+    }
+
+    bool need_replan = !g_path_active ||
+                       (fabsf(g_path_goal[0] - goal_local[0]) +
+                            fabsf(g_path_goal[1] - goal_local[1]) >
+                        1.5f);
+    if (need_replan) {
+        memcpy(g_path_goal, goal_local, sizeof(g_path_goal));
+        g_path_active = path_plan(parent, here, goal_local);
+        g_path_idx = 0;
+        g_path_walk_issued = 0;
+        g_path_replanned_once = 0;
+        memcpy(g_path_last_pos, here, sizeof(g_path_last_pos));
+        g_path_last_move_at = now;
+        if (!g_path_active) {
+            return false; /* no route found - let the caller try a direct walk */
+        }
+    }
+
+    float dx = here[0] - g_path_last_pos[0], dy = here[1] - g_path_last_pos[1];
+    if (dx * dx + dy * dy > 0.001f) {
+        memcpy(g_path_last_pos, here, sizeof(g_path_last_pos));
+        g_path_last_move_at = now;
+    }
+
+    while (g_path_idx < g_path_count) {
+        float *wp = g_path_waypoints[g_path_idx];
+        float wdx = here[0] - wp[0], wdy = here[1] - wp[1];
+        if (sqrtf(wdx * wdx + wdy * wdy) > PATH_WAYPOINT_REACHED) {
+            break;
+        }
+        g_path_idx++;
+        g_path_walk_issued = 0;
+    }
+    if (g_path_idx < g_path_count) {
+        int furthest = g_path_idx;
+        for (int i = g_path_count - 1; i > g_path_idx; i--) {
+            if (path_line_clear_local(parent, here, g_path_waypoints[i])) {
+                furthest = i;
+                break;
+            }
+        }
+        if (furthest != g_path_idx) {
+            g_path_idx = furthest;
+            g_path_walk_issued = 0;
+        }
+    }
+
+    if (g_path_idx >= g_path_count) {
+        g_path_active = 0;
+        *done_out = true;
+        return false;
+    }
+
+    bool stalled = g_path_walk_issued && (now - g_path_issued_at > 0.6f) &&
+                   (now - g_path_last_move_at > PATH_STALL_SEC);
+    if (stalled) {
+        if (g_path_replanned_once) {
+            g_path_active = 0; /* stalled twice - give up this attempt */
+            return false;
+        }
+        g_path_replanned_once = 1;
+        g_path_active = path_plan(parent, here, goal_local);
+        g_path_idx = 0;
+        g_path_walk_issued = 0;
+        if (!g_path_active) {
+            return false;
+        }
+    }
+
+    if (!g_path_walk_issued && g_emu_walkto != NULL) {
+        void *args[2] = {g_path_waypoints[g_path_idx], &speed};
+        inv(g_emu_walkto, emu, args);
+        g_path_walk_issued = 1;
+        g_path_issued_at = now;
+    }
+    return true;
+}
+
+/* Shared with probe_monsters() below, which does the actual resolution (it
+   runs first every tick - see hook_aec_update) and the same generic-
+   dictionary walk technique, just counting instead of picking a winner. */
+static void *g_area_currentarea_field;
+static void *g_area_monsters_field;
+static void *g_monster_reaction_field;
+static void *g_entity_get_name;           /* resolved on Monster - see probe_monsters */
+static void *g_entity_get_currentstate;   /* resolved on Entity - Monster doesn't override it */
 
 /* GameObject.GetComponent(Type) - the same non-generic overload setup_menu
    already uses for AddComponent(Type), since the generic GetComponent<T>()
@@ -1057,9 +1532,38 @@ static void hunt_tick(void)
                 il2cpp_field_static_get_value(g_emu_cellspeed_field, &cs);
                 speed = (float)cs;
             }
-            void *args[2] = {tp, &speed};
-            inv(g_emu_walkto, emu, args);
+
+            /* Open ground is the common case and cheap to confirm - one
+               raycast beats planning a route we do not need. Blocked or no
+               parent transform (fresh spawn, still settling): fall to the
+               A* route, and if THAT fails too (grid too big, unreachable,
+               stalled twice), a direct walk at least tries - the game's own
+               blockedMoveTimer stops it rather than looping forever, same
+               failure mode hunting already had before this feature existed. */
+            void *parent = path_player_parent(player_go);
+            bool clear = parent != NULL && path_line_clear_local(parent, me, tp);
+            if (clear) {
+                if (g_path_active) {
+                    LOGI("path: line to target opened up - dropping route, walking direct");
+                }
+                g_path_active = 0; /* drop any stale route once the line is open */
+                void *args[2] = {tp, &speed};
+                inv(g_emu_walkto, emu, args);
+            } else {
+                if (!g_path_active) {
+                    LOGI("path: direct line blocked - planning a route");
+                }
+                bool done = false;
+                bool navigating = parent != NULL && path_tick(parent, emu, tp, speed, &done);
+                if (!navigating) {
+                    LOGI("path: no route available - falling back to a direct walk anyway");
+                    void *args[2] = {tp, &speed};
+                    inv(g_emu_walkto, emu, args);
+                }
+            }
         }
+    } else {
+        g_path_active = 0; /* in engage range - no route left to maintain */
     }
 
     /* Combat is autoskills' job; hunting just keeps a live target in range. */
@@ -1158,7 +1662,10 @@ static void keyboard_open(int target)
         return;
     }
     g_kb_target = target;
-    const char *seed = target == KB_SPOOF ? g_spoof : (target == KB_TITLE ? g_title : g_input);
+    const char *seed = target == KB_SPOOF   ? g_spoof
+                       : target == KB_TITLE ? g_title
+                       : target == KB_QUEST ? g_quest_id_text
+                                            : g_input;
     int32_t kb_type = 0; /* TouchScreenKeyboardType.Default */
     uint8_t no = 0;
     void *args[5] = {il2cpp_string_new(seed), &kb_type, &no, &no, &no};
@@ -1184,6 +1691,8 @@ static void keyboard_poll(void)
             mstr_to_utf8(text, g_spoof, sizeof(g_spoof));
         } else if (g_kb_target == KB_TITLE) {
             mstr_to_utf8(text, g_title, sizeof(g_title));
+        } else if (g_kb_target == KB_QUEST) {
+            mstr_to_utf8(text, g_quest_id_text, sizeof(g_quest_id_text));
         } else {
             mstr_to_utf8(text, g_input, sizeof(g_input));
         }
@@ -1192,6 +1701,12 @@ static void keyboard_poll(void)
         g_kb = mstr_hold(g_kb, NULL); /* finished or dismissed */
         if (g_kb_target == KB_SPOOF || g_kb_target == KB_TITLE) {
             apply_spoof(1);
+        }
+        if (g_kb_target == KB_QUEST) {
+            g_quest_id = atoi(g_quest_id_text);
+            g_quest_accept_sent = 0; /* fresh ID - any in-flight attempt no longer applies */
+            g_quest_turnin_sent = 0;
+            snprintf(g_quest_status, sizeof(g_quest_status), "quest %d - not farming", g_quest_id);
         }
     }
 }
@@ -1215,6 +1730,124 @@ static void send_typed_packet(void)
     inv(g_request_ctor, req, ctor_args);
     void *send_args[1] = {req};
     inv(g_send_request, g_aec_instance, send_args);
+}
+
+/* Same shape as send_typed_packet, minus the keyboard - for cmds this module
+   sends on its own (getQuests), not ones the user typed. */
+static void send_cmd(const char *cmd)
+{
+    if (g_aec_instance == NULL || g_request_class == NULL || g_request_ctor == NULL ||
+        g_send_request == NULL || !il2cpp_object_new || !il2cpp_string_new) {
+        return;
+    }
+    void *req = il2cpp_object_new(g_request_class);
+    if (req == NULL) {
+        return;
+    }
+    void *ctor_args[1] = {il2cpp_string_new(cmd)};
+    inv(g_request_ctor, req, ctor_args);
+    void *send_args[1] = {req};
+    inv(g_send_request, g_aec_instance, send_args);
+}
+
+/* -------------------------------------------------------------------------
+ * Quest farming (narrow native slice of QuestRunner)
+ *
+ * Accept a quest, keep auto-hunt running so kill-count objectives progress,
+ * and turn in once the quest's own IsReadyForTurnin() says every objective
+ * is satisfied. That method is CALLED, not reimplemented - it already walks
+ * the quest's Requirements (item counts, per-objective completion flags,
+ * all of it) server-synced, the same way the desktop agent calls
+ * q.IsReadyForTurnin() rather than replicating what is behind it.
+ *
+ * Deliberately narrow: this does not act on Interact/Apop/Talk/Cutscene
+ * objectives (QuestRunner's TickInteract/TickApop/TickCutscene), and does
+ * not travel across cells to find them (MapNav). A pure killcount quest
+ * completes end-to-end below; a quest that also needs a machine click or an
+ * NPC conversation will sit at "hunting, not ready yet" forever once the
+ * kill-only objectives are done - a known, logged gap, not a silent one.
+ * ---------------------------------------------------------------------- */
+static void *g_quest_get;                 /* static Quest.Get(int) */
+static void *g_quest_is_ready_turnin;     /* Quest.IsReadyForTurnin() */
+static void *g_player_is_quest_accepted;  /* Player.IsQuestAccepted(int) */
+static void *g_req_accept_class;
+static void *g_req_accept_ctor;           /* RequestQuestAccept(int) */
+static void *g_req_turnin_class;
+static void *g_req_turnin_ctor;           /* RequestTryQuestComplete(int,int) */
+
+static void quest_tick(void)
+{
+    if (!g_quest_farm || g_quest_id <= 0) {
+        return;
+    }
+    float now = inv_float(g_time_get_time, NULL, NULL);
+    if (now < g_next_quest_tick) {
+        return;
+    }
+    g_next_quest_tick = now + 1.0f;
+
+    void *player = g_get_main_player ? inv(g_get_main_player, NULL, NULL) : NULL;
+    if (player == NULL || g_quest_get == NULL) {
+        return;
+    }
+
+    int32_t qid = g_quest_id;
+    void *id_args[1] = {&qid};
+    void *quest = inv(g_quest_get, NULL, id_args);
+    if (quest == NULL) {
+        /* Not cached - the client only knows quest defs it has been sent.
+           getQuests populates Quest.Get() for the current map/storyline,
+           same as opening the quest log once would. */
+        if (now >= g_next_getquests_request) {
+            g_next_getquests_request = now + 5.0f;
+            snprintf(g_quest_status, sizeof(g_quest_status), "requesting quest %d (getQuests)",
+                    qid);
+            send_cmd("getQuests");
+        }
+        return;
+    }
+
+    bool accepted = g_player_is_quest_accepted != NULL &&
+                    inv_bool(g_player_is_quest_accepted, player, id_args);
+    if (!accepted) {
+        if (!g_quest_accept_sent && g_req_accept_class != NULL && g_req_accept_ctor != NULL &&
+            il2cpp_object_new) {
+            void *req = il2cpp_object_new(g_req_accept_class);
+            if (req != NULL) {
+                inv(g_req_accept_ctor, req, id_args);
+                void *send_args[1] = {req};
+                inv(g_send_request, g_aec_instance, send_args);
+                g_quest_accept_sent = 1;
+                snprintf(g_quest_status, sizeof(g_quest_status), "accepting quest %d", qid);
+                LOGI("quest: sent RequestQuestAccept(%d)", qid);
+            }
+        }
+        return;
+    }
+
+    bool ready = g_quest_is_ready_turnin != NULL &&
+                inv_bool(g_quest_is_ready_turnin, quest, NULL);
+    if (!ready) {
+        g_hunt = 1; /* accepted, not done - keep the kill-count objectives moving */
+        snprintf(g_quest_status, sizeof(g_quest_status), "hunting for quest %d", qid);
+        return;
+    }
+
+    if (!g_quest_turnin_sent && g_req_turnin_class != NULL && g_req_turnin_ctor != NULL &&
+        il2cpp_object_new) {
+        void *req = il2cpp_object_new(g_req_turnin_class);
+        if (req != NULL) {
+            int32_t choice = -1;
+            void *turnin_args[2] = {&qid, &choice};
+            inv(g_req_turnin_ctor, req, turnin_args);
+            void *send_args[1] = {req};
+            inv(g_send_request, g_aec_instance, send_args);
+            g_quest_turnin_sent = 1;
+            snprintf(g_quest_status, sizeof(g_quest_status), "quest %d turned in", qid);
+            LOGI("quest: sent RequestTryQuestComplete(%d, -1)", qid);
+            g_quest_farm = 0; /* one accept->turnin cycle per toggle - see menu comment */
+        }
+    }
 }
 
 /* Reads a managed string member, preferring the property getter and falling
@@ -1370,7 +2003,7 @@ static void hook_host_ongui(void *self, void *method)
 
     char buf[128];
     snprintf(buf, sizeof(buf), "Beyond - packets %d", g_pkt_total);
-    gui_text(g_gui_box, 8, 44, 344, 288, buf);
+    gui_text(g_gui_box, 8, 44, 344, 340, buf);
 
     if (gui_button(18, 78, 152, 30, g_block_incoming ? "Block: ON" : "Block: OFF")) {
         g_block_incoming = !g_block_incoming;
@@ -1422,13 +2055,32 @@ static void hook_host_ongui(void *self, void *method)
              g_title[0] ? g_title : "(real)");
     gui_text(g_gui_label, 18, 248, 326, 24, buf);
 
-    /* Auto-hunt: nearest hostile, straight-line approach, no A* yet - see the
-       auto-hunt section's own comment for scope. Shares the cadence with
-       autoskills so combat starts as soon as a target is in range. */
+    /* Auto-hunt: nearest hostile, wall-aware approach (direct walk when the
+       line is clear, A* route when it isn't - see the wall-aware movement
+       section for how). Shares the cadence with autoskills so combat starts
+       as soon as a target is in range. */
     if (gui_button(18, 280, 160, 30, g_hunt ? "Hunt: ON" : "Hunt: OFF")) {
         g_hunt = !g_hunt;
         g_next_hunt = 0.0f;
     }
+
+    /* Quest farming: accept, hunt (forces Hunt on), turn in once
+       Quest.IsReadyForTurnin() agrees - kill-count objectives only, see the
+       quest farming section's own comment for what this does not cover. */
+    if (gui_button(18, 316, 90, 30, "Quest ID")) {
+        keyboard_open(KB_QUEST);
+    }
+    if (gui_button(114, 316, 90, 30, g_quest_farm ? "Farm: ON" : "Farm: OFF")) {
+        g_quest_farm = !g_quest_farm;
+        if (g_quest_farm) {
+            g_quest_accept_sent = 0;
+            g_quest_turnin_sent = 0;
+            g_next_quest_tick = 0.0f;
+            g_next_getquests_request = 0.0f;
+        }
+    }
+    snprintf(buf, sizeof(buf), "quest: %s", g_quest_id > 0 ? g_quest_status : "(no ID set)");
+    gui_text(g_gui_label, 18, 352, 326, 24, buf);
 
     /* Packet log, in its own window rather than crowding the tools panel. */
     if (g_log_open) {
@@ -1631,6 +2283,30 @@ static void setup_menu(void *domain,
     LOGI("menu: Request=%p ctor=%p Cmd=%p sendRequest=%p", g_request_class, g_request_ctor,
          g_request_cmd_field, g_send_request);
 
+    /* Quest farming: Quest.Get/IsReadyForTurnin, Player.IsQuestAccepted, and
+       the two concrete Request subclasses whose own constructors build the
+       List<string> Params internally - sidesteps ever needing to construct
+       a generic List<string> from native code ourselves. */
+    if (g_cs_image != NULL) {
+        void *quest_class = class_from_name(g_cs_image, "", "Quest");
+        void *player_class = class_from_name(g_cs_image, "", "Player");
+        if (quest_class != NULL) {
+            g_quest_get = il2cpp_class_get_method_from_name(quest_class, "Get", 1);
+            g_quest_is_ready_turnin =
+                il2cpp_class_get_method_from_name(quest_class, "IsReadyForTurnin", 0);
+        }
+        g_player_is_quest_accepted =
+            il2cpp_class_get_method_from_name(player_class, "IsQuestAccepted", 1);
+        g_req_accept_class = class_from_name(g_cs_image, "", "RequestQuestAccept");
+        g_req_accept_ctor = find_method(g_req_accept_class, ".ctor", 1, 0, NULL);
+        g_req_turnin_class = class_from_name(g_cs_image, "", "RequestTryQuestComplete");
+        g_req_turnin_ctor = find_method(g_req_turnin_class, ".ctor", 2, 0, NULL);
+        LOGI("menu: quest Get=%p IsReadyForTurnin=%p IsQuestAccepted=%p Accept=%p/%p "
+             "TurnIn=%p/%p",
+             g_quest_get, g_quest_is_ready_turnin, g_player_is_quest_accepted,
+             g_req_accept_class, g_req_accept_ctor, g_req_turnin_class, g_req_turnin_ctor);
+    }
+
     /* Autoskills: UISkillSlots.GetSlot(int) + SkillSlotButton.UseSkill(bool),
        with the singleton captured from its own Register call. */
     g_time_get_time = find_method(class_from_name(core_image, "UnityEngine", "Time"),
@@ -1742,6 +2418,40 @@ static void setup_menu(void *domain,
              g_transform_get_localpos, g_targetable_class, g_targetable_type_obj,
              g_targetable_clickme, g_emu_class, g_emu_type_obj, g_emu_walkto,
              g_emu_cellspeed_field);
+
+        /* Wall-aware movement bindings - see the module comment above
+           path_player_parent() for why OverlapBox stands in for the
+           (stripped) OverlapCircle, and which methods were confirmed
+           present via probe_api before any of this was written. */
+        void *phys2d = assembly_open(domain, "UnityEngine.Physics2DModule");
+        if (phys2d != NULL) {
+            void *p2d_image = assembly_image(phys2d);
+            void *physics2d_class = class_from_name(p2d_image, "UnityEngine", "Physics2D");
+            void *raycasthit2d_class =
+                class_from_name(p2d_image, "UnityEngine", "RaycastHit2D");
+            g_p2d_raycast = find_method(physics2d_class, "Raycast", 4, 2, "Single");
+            g_p2d_overlapbox = find_method(physics2d_class, "OverlapBox", 4, 2, "Single");
+            g_raycasthit2d_get_collider = find_method(raycasthit2d_class, "get_collider", 0, 0,
+                                                      NULL);
+        } else {
+            LOGE("menu: UnityEngine.Physics2DModule not found - wall-aware movement disabled");
+        }
+        g_transform_transformpoint = find_method(transform_class, "TransformPoint", 1, 0, NULL);
+        g_transform_get_lossyscale = find_method(transform_class, "get_lossyScale", 0, 0, NULL);
+        g_transform_get_parent = find_method(transform_class, "get_parent", 0, 0, NULL);
+
+        void *layermask_class = class_from_name(core_image, "UnityEngine", "LayerMask");
+        void *name_to_layer = find_method(layermask_class, "NameToLayer", 1, 0, "String");
+        if (name_to_layer != NULL && il2cpp_string_new) {
+            void *args[1] = {il2cpp_string_new("Blocker")};
+            int layer = inv_int(name_to_layer, NULL, args);
+            g_blocker_mask = layer >= 0 ? (1 << layer) : -1;
+        }
+        LOGI("menu: pathing Raycast=%p OverlapBox=%p get_collider=%p TransformPoint=%p "
+             "lossyScale=%p get_parent=%p BlockerMask=%d",
+             g_p2d_raycast, g_p2d_overlapbox, g_raycasthit2d_get_collider,
+             g_transform_transformpoint, g_transform_get_lossyscale, g_transform_get_parent,
+             g_blocker_mask);
     }
 
     void *go = il2cpp_object_new(go_class);
@@ -1948,6 +2658,7 @@ static void *hook_aec_update(void *a0, void *a1)
     g_aec_instance = a0; /* AEC.Update is an instance method: a0 is the AEC */
     autoskills_tick();
     spoof_tick();
+    quest_tick(); /* may turn hunting on - runs before hunt_tick so this tick sees it */
     hunt_tick();
     probe_monsters();
     if (!g_ui_ready) {
