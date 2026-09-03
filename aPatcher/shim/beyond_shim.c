@@ -757,6 +757,68 @@ static int g_autoskills;
 static int g_skill_slot;
 static float g_next_skill;
 
+/* Skill gating: mirrors BeyondAgentClass.IsSkillSlotButtonDisabled /
+   IsSkillOnCooldown. Without this the loop is a blind spammer - it fires into
+   greyed-out or cooling-down slots every tick, each one a rejected round trip
+   to the server for nothing. The overlay's concrete type is only knowable
+   once we have a live instance, so - like the desktop reflection - resolve
+   cooldownActive()/cdRemain lazily on first sight and cache by class. */
+static void *g_slotbtn_disabled_field;    /* SkillSlotButton.disabled        (bool)   */
+static void *g_slotbtn_pendingcd_field;   /* SkillSlotButton.pendingCooldown (bool)   */
+static void *g_slotbtn_cooldown_field;    /* SkillSlotButton.cooldown        (object) */
+static void *g_cdoverlay_class;
+static void *g_cdoverlay_active_method;   /* overlay.cooldownActive()  (bool),  tried first  */
+static void *g_cdoverlay_remain_field;    /* overlay.cdRemain          (float), fallback     */
+
+static bool skill_disabled(void *btn)
+{
+    if (btn == NULL || g_slotbtn_disabled_field == NULL || !il2cpp_field_get_value) {
+        return false;
+    }
+    uint8_t v = 0;
+    il2cpp_field_get_value(btn, g_slotbtn_disabled_field, &v);
+    return v != 0;
+}
+
+static bool skill_on_cooldown(void *btn)
+{
+    if (btn == NULL || !il2cpp_field_get_value) {
+        return false;
+    }
+    if (g_slotbtn_pendingcd_field != NULL) {
+        uint8_t v = 0;
+        il2cpp_field_get_value(btn, g_slotbtn_pendingcd_field, &v);
+        if (v != 0) {
+            return true;
+        }
+    }
+    if (g_slotbtn_cooldown_field == NULL || !il2cpp_object_get_class) {
+        return false;
+    }
+    void *overlay = NULL;
+    il2cpp_field_get_value(btn, g_slotbtn_cooldown_field, &overlay);
+    if (overlay == NULL) {
+        return false;
+    }
+    void *klass = il2cpp_object_get_class(overlay);
+    if (klass != g_cdoverlay_class) {
+        g_cdoverlay_class = klass;
+        g_cdoverlay_active_method = il2cpp_class_get_method_from_name
+            ? il2cpp_class_get_method_from_name(klass, "cooldownActive", 0) : NULL;
+        g_cdoverlay_remain_field = il2cpp_class_get_field_from_name
+            ? il2cpp_class_get_field_from_name(klass, "cdRemain") : NULL;
+    }
+    if (g_cdoverlay_active_method != NULL) {
+        return inv_bool(g_cdoverlay_active_method, overlay, NULL);
+    }
+    if (g_cdoverlay_remain_field != NULL) {
+        float remain = 0.0f;
+        il2cpp_field_get_value(overlay, g_cdoverlay_remain_field, &remain);
+        return remain > 0.0f;
+    }
+    return false;
+}
+
 /* Nameplate spoof.
    RefreshNameplate() is a dead end: it looks for a TextMeshProUGUI on the
    nameplate root, but the root carries a NameplateView and the text lives on
@@ -1170,8 +1232,11 @@ done:
  * Autoskills
  *
  * Mirrors BeyondAgentClass: UISkillSlots.GetSlot(i) then UseSkill(true) and
- * UseSkill(false), cycling slots 0-4 on a timer. Runs from the AEC.Update tick
- * because it must be on Unity's main thread.
+ * UseSkill(false), gated by skill_disabled()/skill_on_cooldown() the same way
+ * the desktop agent's IsSkillSlotButtonDisabled/IsSkillOnCooldown gate it -
+ * firing into a greyed-out or cooling-down slot just spends a server round
+ * trip on a packet that gets rejected. Runs from the AEC.Update tick because
+ * it must be on Unity's main thread.
  * ---------------------------------------------------------------------- */
 static void autoskills_tick(void)
 {
@@ -1182,21 +1247,36 @@ static void autoskills_tick(void)
     if (now < g_next_skill) {
         return;
     }
-    int32_t slot = g_skill_slot;
-    void *slot_args[1] = {&slot};
-    void *btn = inv(g_get_slot, g_skillslots, slot_args);
-    if (btn != NULL) {
-        /* ponytail: no cooldown or disabled check, unlike the desktop agent -
-           the server rejects a skill that is not ready, so the cost is a wasted
-           packet. Add IsSkillOnCooldown-style gating if that ever matters. */
+
+    /* Scan forward for a slot that is actually ready, same as the desktop's
+       combo walk: skip disabled/cooling-down slots without wasting the cast
+       cadence on them, but don't spin forever within one frame if nothing is
+       up yet. */
+    for (int tries = 0; tries < 5; tries++) {
+        int32_t slot = g_skill_slot;
+        void *slot_args[1] = {&slot};
+        void *btn = inv(g_get_slot, g_skillslots, slot_args);
+        g_skill_slot = (g_skill_slot + 1) % 5;
+
+        if (btn == NULL) {
+            continue;
+        }
+        if (skill_disabled(btn) || skill_on_cooldown(btn)) {
+            continue;
+        }
+
         uint8_t down = 1, up = 0;
         void *a_down[1] = {&down};
         void *a_up[1] = {&up};
         inv(g_use_skill, btn, a_down);
         inv(g_use_skill, btn, a_up);
+        g_next_skill = now + 0.6f;
+        return;
     }
-    g_skill_slot = (g_skill_slot + 1) % 5;
-    g_next_skill = now + 0.6f;
+
+    /* Nothing in the rotation was ready. Re-check soon rather than idling for
+       a full cast cycle - matches the desktop agent's 100ms cooldown retry. */
+    g_next_skill = now + 0.1f;
 }
 
 /* UISkillSlots derives from Singleton<T>, whose static Instance lives on an
@@ -1322,8 +1402,16 @@ static void setup_menu(void *domain,
             hook_func("UISkillSlots.Register", reg_code, (void *)hook_register_slot,
                       (void **)&orig_register);
         }
-        LOGI("menu: skills GetSlot=%p UseSkill=%p Register=%p time=%p", g_get_slot,
-             g_use_skill, reg, g_time_get_time);
+        if (il2cpp_class_get_field_from_name) {
+            g_slotbtn_disabled_field = il2cpp_class_get_field_from_name(slot_btn, "disabled");
+            g_slotbtn_pendingcd_field =
+                il2cpp_class_get_field_from_name(slot_btn, "pendingCooldown");
+            g_slotbtn_cooldown_field = il2cpp_class_get_field_from_name(slot_btn, "cooldown");
+        }
+        LOGI("menu: skills GetSlot=%p UseSkill=%p Register=%p time=%p disabled=%p "
+             "pendingCooldown=%p cooldown=%p",
+             g_get_slot, g_use_skill, reg, g_time_get_time, g_slotbtn_disabled_field,
+             g_slotbtn_pendingcd_field, g_slotbtn_cooldown_field);
 
         /* Nameplate spoof: replace what Player.ComposeNameplateText returns. */
         void *player = class_from_name(g_cs_image, "", "Player");
