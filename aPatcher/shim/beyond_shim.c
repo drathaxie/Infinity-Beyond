@@ -1757,6 +1757,220 @@ static void *g_req_turnin_class;
 static void *g_req_turnin_ctor;                 /* RequestTryQuestComplete(int,int)        */
 static int g_quest_last_id;                     /* detects the tracker moving to a new quest */
 
+/* Objective dispatch: which incomplete QuestTurninItem to act on, and how.
+   QuestObjectiveType (decomp): Turnin=0, Killcount=1, Interact=2, Talk=3,
+   Apop=4, Cutscene=5. Killcount already works (existing hunt/autoskills);
+   this adds Interact and Apop/Talk. Cutscene is not covered - logged as
+   such rather than silently stalling. */
+static void *g_quest_turnins_field;    /* Quest.Turnins (QuestTurninItem[]) */
+static void *g_qti_qoid_field;
+static void *g_qti_qotype_field;
+static void *g_qti_getrefint_method;   /* QuestTurninItem.GetRefInt(int) - avoids ever
+                                          touching RefArray's own array storage directly */
+static void *g_qti_refscontains_method;/* QuestTurninItem.RefsContains(string) */
+static void *g_player_quests_field;    /* Player.Quests (PlayerQuestData) */
+static void *g_pqd_is_objective_complete; /* PlayerQuestData.IsObjectiveComplete(int) */
+static void *g_area_cells_field;       /* Area.Cells (Dictionary<string,MapCell>) */
+static void *g_entity_frame_field;     /* Entity.Frame (string) */
+static void *g_entity_apopid_field;    /* Entity.apopID (int, default -1) */
+static void *g_component_get_transform; /* Component.get_transform() - MapCell is a Component,
+                                           not a GameObject, so this is a separate resolution
+                                           from GameObject.get_transform */
+static void *g_transform_get_childcount;
+static void *g_transform_get_child;     /* Transform.GetChild(int) */
+static void *g_transform_get_gameobject;
+static void *g_object_get_name;         /* UnityEngine.Object.get_name - not overridden by
+                                           MapMachine/NPCButton, safe to resolve once here */
+static void *g_mapmachine_type_obj;
+static void *g_mapmachine_interact;     /* MapMachine.Interact() */
+static void *g_npcbutton_type_obj;
+static void *g_npcbutton_interact;      /* NPCButton.Interact() */
+
+/* Interact objectives: recursive search of a cell's transform subtree for a
+   MapMachine whose GameObject name the objective's own RefsContains()
+   accepts - called, not reimplemented, same reasoning as IsReadyForTurnin.
+   No FindObjectsByType here (the generic overload this shim has no path to
+   resolve) - walking the CURRENT CELL's subtree is narrower than the
+   desktop's whole-map MapNav scan, but the current cell is where an
+   interactable has to be reached anyway. A machine in a different,
+   not-yet-visited cell will not be found - logged as such, not silently. */
+static void *find_machine_in_subtree(void *transform, void *qti, int depth)
+{
+    if (transform == NULL || depth > 14 || g_mapmachine_type_obj == NULL ||
+        g_qti_refscontains_method == NULL || g_object_get_name == NULL) {
+        return NULL;
+    }
+    void *go = g_transform_get_gameobject ? inv(g_transform_get_gameobject, transform, NULL)
+                                          : NULL;
+    void *machine = go ? get_component(go, g_mapmachine_type_obj) : NULL;
+    if (machine != NULL) {
+        void *name_str = inv(g_object_get_name, go, NULL);
+        if (name_str != NULL) {
+            void *args[1] = {name_str};
+            if (inv_bool(g_qti_refscontains_method, qti, args)) {
+                return machine;
+            }
+        }
+    }
+    if (g_transform_get_childcount == NULL || g_transform_get_child == NULL) {
+        return NULL;
+    }
+    int32_t count = inv_int(g_transform_get_childcount, transform, NULL);
+    for (int32_t i = 0; i < count; i++) {
+        void *idx_args[1] = {&i};
+        void *child = inv(g_transform_get_child, transform, idx_args);
+        void *found = find_machine_in_subtree(child, qti, depth + 1);
+        if (found != NULL) {
+            return found;
+        }
+    }
+    return NULL;
+}
+
+/* Apop/Talk objectives: the friendly Monster carrying the wanted apopID.
+   Reuses the exact Area.currentArea.Monsters walk find_nearest_hostile does
+   (down to the field/method handles) - same generic Dictionary<int,Monster>
+   technique, filtering on apopID instead of reactionType==Hostile. */
+static void *find_apop_npc(int32_t want_apop)
+{
+    if (want_apop <= 0 || g_area_currentarea_field == NULL || g_area_monsters_field == NULL ||
+        g_entity_apopid_field == NULL || !il2cpp_field_static_get_value) {
+        return NULL;
+    }
+    void *area = NULL;
+    il2cpp_field_static_get_value(g_area_currentarea_field, &area);
+    if (area == NULL) {
+        return NULL;
+    }
+    void *dict = NULL;
+    il2cpp_field_get_value(area, g_area_monsters_field, &dict);
+    if (dict == NULL) {
+        return NULL;
+    }
+    void *dict_class = il2cpp_object_get_class(dict);
+    void *get_enumerator = il2cpp_class_get_method_from_name(dict_class, "GetEnumerator", 0);
+    void *boxed_enum = get_enumerator ? inv(get_enumerator, dict, NULL) : NULL;
+    void *enum_raw = boxed_enum ? il2cpp_object_unbox(boxed_enum) : NULL;
+    if (enum_raw == NULL) {
+        return NULL;
+    }
+    void *enum_class = il2cpp_object_get_class(boxed_enum);
+    void *move_next = il2cpp_class_get_method_from_name(enum_class, "MoveNext", 0);
+    void *get_current = il2cpp_class_get_method_from_name(enum_class, "get_Current", 0);
+    if (move_next == NULL || get_current == NULL) {
+        return NULL;
+    }
+    for (int i = 0; i < 500 && inv_bool(move_next, enum_raw, NULL); i++) {
+        void *boxed_kv = inv(get_current, enum_raw, NULL);
+        void *kv_raw = boxed_kv ? il2cpp_object_unbox(boxed_kv) : NULL;
+        if (kv_raw == NULL) {
+            continue;
+        }
+        void *kv_class = il2cpp_object_get_class(boxed_kv);
+        void *get_value = il2cpp_class_get_method_from_name(kv_class, "get_Value", 0);
+        void *mon = get_value ? inv(get_value, kv_raw, NULL) : NULL;
+        if (mon == NULL) {
+            continue;
+        }
+        int32_t apop = -1;
+        il2cpp_field_get_value(mon, g_entity_apopid_field, &apop);
+        if (apop == want_apop) {
+            return mon;
+        }
+    }
+    return NULL;
+}
+
+/* First QuestTurninItem in Quest.Turnins the player has not completed, via
+   PlayerQuestData.IsObjectiveComplete(QOID) - same array-of-reference-type
+   walk as the Monsters dictionary (GetEnumerator/MoveNext/get_Current on the
+   array instance's own class), just picking the first non-complete entry
+   instead of aggregating. NULL if every visible objective reads complete
+   (including if Turnins/Quests themselves are not resolvable). */
+static void *next_incomplete_objective(void *quest, void *player, int32_t *qotype_out)
+{
+    *qotype_out = -1;
+    if (g_quest_turnins_field == NULL || g_player_quests_field == NULL ||
+        g_pqd_is_objective_complete == NULL || g_qti_qoid_field == NULL) {
+        return NULL;
+    }
+    void *turnins = NULL;
+    il2cpp_field_get_value(quest, g_quest_turnins_field, &turnins);
+    void *pq = NULL;
+    il2cpp_field_get_value(player, g_player_quests_field, &pq);
+    if (turnins == NULL || pq == NULL) {
+        return NULL;
+    }
+
+    void *arr_class = il2cpp_object_get_class(turnins);
+    void *get_enumerator = il2cpp_class_get_method_from_name(arr_class, "GetEnumerator", 0);
+    void *boxed_enum = get_enumerator ? inv(get_enumerator, turnins, NULL) : NULL;
+    void *enum_raw = boxed_enum ? il2cpp_object_unbox(boxed_enum) : NULL;
+    if (enum_raw == NULL) {
+        return NULL;
+    }
+    void *enum_class = il2cpp_object_get_class(boxed_enum);
+    void *move_next = il2cpp_class_get_method_from_name(enum_class, "MoveNext", 0);
+    void *get_current = il2cpp_class_get_method_from_name(enum_class, "get_Current", 0);
+    if (move_next == NULL || get_current == NULL) {
+        return NULL;
+    }
+    for (int i = 0; i < 32 && inv_bool(move_next, enum_raw, NULL); i++) {
+        void *item = inv(get_current, enum_raw, NULL);
+        if (item == NULL) {
+            continue;
+        }
+        int32_t qoid = 0;
+        il2cpp_field_get_value(item, g_qti_qoid_field, &qoid);
+        void *qoid_args[1] = {&qoid};
+        if (!inv_bool(g_pqd_is_objective_complete, pq, qoid_args)) {
+            if (g_qti_qotype_field != NULL) {
+                il2cpp_field_get_value(item, g_qti_qotype_field, qotype_out);
+            }
+            return item;
+        }
+    }
+    return NULL;
+}
+
+/* Current MapCell's Transform, via Area.Cells[Entity.Frame] - a dictionary
+   lookup by key (get_Item), not the enumerator walk the other dictionary
+   uses elsewhere; the key is already known, so indexing it directly is both
+   simpler and cheaper. NULL on any miss (no area, no cell for this frame,
+   dictionary indexer threw - inv() swallows exceptions and returns NULL,
+   which doubles as "key not found" here). */
+static void *current_cell_transform(void *player)
+{
+    if (g_area_currentarea_field == NULL || g_area_cells_field == NULL ||
+        g_entity_frame_field == NULL || g_component_get_transform == NULL ||
+        !il2cpp_field_static_get_value) {
+        return NULL;
+    }
+    void *area = NULL;
+    il2cpp_field_static_get_value(g_area_currentarea_field, &area);
+    if (area == NULL) {
+        return NULL;
+    }
+    void *cells = NULL;
+    il2cpp_field_get_value(area, g_area_cells_field, &cells);
+    if (cells == NULL) {
+        return NULL;
+    }
+    void *frame = NULL;
+    il2cpp_field_get_value(player, g_entity_frame_field, &frame);
+    if (frame == NULL) {
+        return NULL;
+    }
+    void *cells_class = il2cpp_object_get_class(cells);
+    void *get_item = il2cpp_class_get_method_from_name(cells_class, "get_Item", 1);
+    if (get_item == NULL) {
+        return NULL;
+    }
+    void *args[1] = {frame};
+    void *cell = inv(get_item, cells, args);
+    return cell ? inv(g_component_get_transform, cell, NULL) : NULL;
+}
+
 static void quest_tick(void)
 {
     if (!g_quest_farm || g_uiquesttracker_get_currentquest == NULL) {
@@ -1812,8 +2026,56 @@ static void quest_tick(void)
     bool ready = g_quest_is_ready_turnin != NULL &&
                 inv_bool(g_quest_is_ready_turnin, quest, NULL);
     if (!ready) {
-        g_hunt = 1; /* accepted, not done - keep the kill-count objectives moving */
-        snprintf(g_quest_status, sizeof(g_quest_status), "hunting for quest %d", qid);
+        int32_t qotype = -1;
+        void *obj = next_incomplete_objective(quest, player, &qotype);
+        /* QuestObjectiveType, per the decomp: Turnin=0 Killcount=1 Interact=2
+           Talk=3 Apop=4 Cutscene=5. */
+        if (obj == NULL) {
+            /* Nothing we can see is incomplete, yet IsReadyForTurnin says
+               not ready - most likely a Turnin-type item-count objective,
+               which is server-tracked inventory, not something to act on
+               here. Hunting is harmless if nothing needs it. */
+            g_hunt = 1;
+            snprintf(g_quest_status, sizeof(g_quest_status),
+                    "quest %d - no actionable objective visible, hunting", qid);
+        } else if (qotype == 2) { /* Interact */
+            g_hunt = 0;           /* a machine click needs the player still, not chasing a mob */
+            void *cell_tr = current_cell_transform(player);
+            void *machine = cell_tr ? find_machine_in_subtree(cell_tr, obj, 0) : NULL;
+            if (machine != NULL && g_mapmachine_interact != NULL) {
+                inv(g_mapmachine_interact, machine, NULL);
+                snprintf(g_quest_status, sizeof(g_quest_status),
+                        "quest %d - clicked machine for current objective", qid);
+            } else {
+                snprintf(g_quest_status, sizeof(g_quest_status),
+                        "quest %d - interact target not in current cell", qid);
+            }
+        } else if (qotype == 3 || qotype == 4) { /* Talk / Apop */
+            g_hunt = 0;
+            int32_t zero = 0;
+            void *ref_args[1] = {&zero};
+            int32_t want_apop = g_qti_getrefint_method != NULL
+                                    ? inv_int(g_qti_getrefint_method, obj, ref_args)
+                                    : -1;
+            void *npc = find_apop_npc(want_apop);
+            void *npc_go = npc ? inv(g_entity_getgameobject, npc, NULL) : NULL;
+            void *npcbtn = npc_go ? get_component(npc_go, g_npcbutton_type_obj) : NULL;
+            if (npcbtn != NULL && g_npcbutton_interact != NULL) {
+                inv(g_npcbutton_interact, npcbtn, NULL);
+                snprintf(g_quest_status, sizeof(g_quest_status),
+                        "quest %d - talked to NPC (apop %d)", qid, want_apop);
+            } else {
+                snprintf(g_quest_status, sizeof(g_quest_status),
+                        "quest %d - apop %d not found in current map", qid, want_apop);
+            }
+        } else if (qotype == 5) { /* Cutscene - not covered */
+            g_hunt = 1;
+            snprintf(g_quest_status, sizeof(g_quest_status),
+                    "quest %d - cutscene objective not supported, hunting meanwhile", qid);
+        } else { /* Killcount, or unrecognized - hunting is always a safe default */
+            g_hunt = 1;
+            snprintf(g_quest_status, sizeof(g_quest_status), "hunting for quest %d", qid);
+        }
         return;
     }
 
@@ -2297,6 +2559,77 @@ static void setup_menu(void *domain,
              g_uiquesttracker_get_currentquest, g_quest_get_id, g_quest_is_ready_turnin,
              g_player_is_quest_accepted, g_req_accept_class, g_req_accept_ctor,
              g_req_turnin_class, g_req_turnin_ctor);
+
+        /* Objective dispatch: Interact (machine click) and Apop/Talk (NPC
+           click). See next_incomplete_objective()/find_machine_in_subtree()/
+           find_apop_npc() for how these get used. */
+        void *entity_c = class_from_name(g_cs_image, "", "Entity");
+        void *area_c = class_from_name(g_cs_image, "", "Area");
+        void *qti_class = class_from_name(g_cs_image, "", "QuestTurninItem");
+        void *pqd_class = class_from_name(g_cs_image, "", "PlayerQuestData");
+        void *mapmachine_class = class_from_name(g_cs_image, "", "MapMachine");
+        void *npcbutton_class = class_from_name(g_cs_image, "", "NPCButton");
+        void *component_class = class_from_name(core_image, "UnityEngine", "Component");
+        void *tf_class = class_from_name(core_image, "UnityEngine", "Transform");
+
+        if (quest_class != NULL) {
+            g_quest_turnins_field = il2cpp_class_get_field_from_name
+                                        ? il2cpp_class_get_field_from_name(quest_class, "Turnins")
+                                        : NULL;
+        }
+        if (qti_class != NULL && il2cpp_class_get_field_from_name) {
+            g_qti_qoid_field = il2cpp_class_get_field_from_name(qti_class, "QOID");
+            g_qti_qotype_field = il2cpp_class_get_field_from_name(qti_class, "QOType");
+            g_qti_getrefint_method = il2cpp_class_get_method_from_name(qti_class, "GetRefInt", 1);
+            g_qti_refscontains_method =
+                il2cpp_class_get_method_from_name(qti_class, "RefsContains", 1);
+        }
+        if (player_class != NULL && il2cpp_class_get_field_from_name) {
+            g_player_quests_field = il2cpp_class_get_field_from_name(player_class, "Quests");
+        }
+        if (pqd_class != NULL) {
+            g_pqd_is_objective_complete =
+                il2cpp_class_get_method_from_name(pqd_class, "IsObjectiveComplete", 1);
+        }
+        if (area_c != NULL && il2cpp_class_get_field_from_name) {
+            g_area_cells_field = il2cpp_class_get_field_from_name(area_c, "Cells");
+        }
+        if (entity_c != NULL && il2cpp_class_get_field_from_name) {
+            g_entity_frame_field = il2cpp_class_get_field_from_name(entity_c, "Frame");
+            g_entity_apopid_field = il2cpp_class_get_field_from_name(entity_c, "apopID");
+        }
+        if (component_class != NULL) {
+            g_component_get_transform =
+                il2cpp_class_get_method_from_name(component_class, "get_transform", 0);
+        }
+        if (tf_class != NULL) {
+            g_transform_get_childcount =
+                il2cpp_class_get_method_from_name(tf_class, "get_childCount", 0);
+            g_transform_get_child = il2cpp_class_get_method_from_name(tf_class, "GetChild", 1);
+            g_transform_get_gameobject =
+                il2cpp_class_get_method_from_name(tf_class, "get_gameObject", 0);
+        }
+        if (obj_class != NULL) {
+            g_object_get_name = il2cpp_class_get_method_from_name(obj_class, "get_name", 0);
+        }
+        if (mapmachine_class != NULL) {
+            g_mapmachine_type_obj = il2cpp_type_get_object(il2cpp_class_get_type(mapmachine_class));
+            g_mapmachine_interact = il2cpp_class_get_method_from_name(mapmachine_class, "Interact", 0);
+        }
+        if (npcbutton_class != NULL) {
+            g_npcbutton_type_obj = il2cpp_type_get_object(il2cpp_class_get_type(npcbutton_class));
+            g_npcbutton_interact = il2cpp_class_get_method_from_name(npcbutton_class, "Interact", 0);
+        }
+        LOGI("menu: objectives Turnins=%p QOID=%p QOType=%p GetRefInt=%p RefsContains=%p "
+             "Quests=%p IsObjComplete=%p Cells=%p Frame=%p apopID=%p",
+             g_quest_turnins_field, g_qti_qoid_field, g_qti_qotype_field, g_qti_getrefint_method,
+             g_qti_refscontains_method, g_player_quests_field, g_pqd_is_objective_complete,
+             g_area_cells_field, g_entity_frame_field, g_entity_apopid_field);
+        LOGI("menu: objectives Component.transform=%p childCount=%p GetChild=%p "
+             "tf.gameObject=%p Object.name=%p MapMachine=%p/%p NPCButton=%p/%p",
+             g_component_get_transform, g_transform_get_childcount, g_transform_get_child,
+             g_transform_get_gameobject, g_object_get_name, g_mapmachine_type_obj,
+             g_mapmachine_interact, g_npcbutton_type_obj, g_npcbutton_interact);
     }
 
     /* Autoskills: UISkillSlots.GetSlot(int) + SkillSlotButton.UseSkill(bool),
