@@ -861,6 +861,7 @@ static void *g_emu_walkto;              /* EntityMovementUpdater.walkTo(Vector3,
 static void *g_emu_cellspeed_field;     /* static int */
 static int g_hunt;
 static float g_next_hunt;
+static float g_hunt_settle_until;       /* pause hunting until this Time.time, post-revive */
 static float g_max_engage_dist = 9.0f;  /* matches QuestRunner.MaxEngageDist */
 
 /* Shared with the nameplate spoof further down, which also needs the local
@@ -996,6 +997,24 @@ static void hunt_tick(void)
     if (player == NULL) {
         return;
     }
+
+    /* Death/respawn: mirrors QuestRunner.PlayerIsDead()/TickRespawning().
+       Targeting or walking while dead is nonsensical - the click has nothing
+       to act on and the walk goes nowhere - so pause outright rather than
+       let find_nearest_hostile spin on it. On revive, give the game a beat
+       to actually place the character (same 1.5s the desktop agent waits)
+       before resuming: position/area reads immediately after a respawn can
+       still reflect the pre-death state for a frame or two. */
+    bool dead = g_entity_get_currentstate != NULL &&
+                inv_int(g_entity_get_currentstate, player, NULL) == 0; /* State.Dead */
+    if (dead) {
+        g_hunt_settle_until = now + 1.5f;
+        return;
+    }
+    if (now < g_hunt_settle_until) {
+        return;
+    }
+
     float me[3];
     if (!read_local_pos(player, me)) {
         return;
