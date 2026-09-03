@@ -785,16 +785,12 @@ static int g_kb_target;    /* which buffer the open keyboard writes into */
 #define KB_CMD 0
 #define KB_SPOOF 1
 #define KB_TITLE 2
-#define KB_QUEST 3
 
-/* Quest-farm state shared between the keyboard (quest ID entry) and
-   quest_tick() further down, which does the actual accept/hunt/turn-in
-   work once bindings are resolved. */
+/* Quest-farm state, read/written by quest_tick() further down. No ID entry -
+   it acts on whatever UIQuestTracker.CurrentQuest already is; see that
+   function's own comment for why. */
 static int g_quest_farm;
-static char g_quest_id_text[12] = "";
-static int g_quest_id;
 static float g_next_quest_tick;
-static float g_next_getquests_request;
 static int g_quest_accept_sent;
 static int g_quest_turnin_sent;
 static char g_quest_status[80] = "idle";
@@ -1662,10 +1658,7 @@ static void keyboard_open(int target)
         return;
     }
     g_kb_target = target;
-    const char *seed = target == KB_SPOOF   ? g_spoof
-                       : target == KB_TITLE ? g_title
-                       : target == KB_QUEST ? g_quest_id_text
-                                            : g_input;
+    const char *seed = target == KB_SPOOF ? g_spoof : (target == KB_TITLE ? g_title : g_input);
     int32_t kb_type = 0; /* TouchScreenKeyboardType.Default */
     uint8_t no = 0;
     void *args[5] = {il2cpp_string_new(seed), &kb_type, &no, &no, &no};
@@ -1691,8 +1684,6 @@ static void keyboard_poll(void)
             mstr_to_utf8(text, g_spoof, sizeof(g_spoof));
         } else if (g_kb_target == KB_TITLE) {
             mstr_to_utf8(text, g_title, sizeof(g_title));
-        } else if (g_kb_target == KB_QUEST) {
-            mstr_to_utf8(text, g_quest_id_text, sizeof(g_quest_id_text));
         } else {
             mstr_to_utf8(text, g_input, sizeof(g_input));
         }
@@ -1701,12 +1692,6 @@ static void keyboard_poll(void)
         g_kb = mstr_hold(g_kb, NULL); /* finished or dismissed */
         if (g_kb_target == KB_SPOOF || g_kb_target == KB_TITLE) {
             apply_spoof(1);
-        }
-        if (g_kb_target == KB_QUEST) {
-            g_quest_id = atoi(g_quest_id_text);
-            g_quest_accept_sent = 0; /* fresh ID - any in-flight attempt no longer applies */
-            g_quest_turnin_sent = 0;
-            snprintf(g_quest_status, sizeof(g_quest_status), "quest %d - not farming", g_quest_id);
         }
     }
 }
@@ -1732,26 +1717,21 @@ static void send_typed_packet(void)
     inv(g_send_request, g_aec_instance, send_args);
 }
 
-/* Same shape as send_typed_packet, minus the keyboard - for cmds this module
-   sends on its own (getQuests), not ones the user typed. */
-static void send_cmd(const char *cmd)
-{
-    if (g_aec_instance == NULL || g_request_class == NULL || g_request_ctor == NULL ||
-        g_send_request == NULL || !il2cpp_object_new || !il2cpp_string_new) {
-        return;
-    }
-    void *req = il2cpp_object_new(g_request_class);
-    if (req == NULL) {
-        return;
-    }
-    void *ctor_args[1] = {il2cpp_string_new(cmd)};
-    inv(g_request_ctor, req, ctor_args);
-    void *send_args[1] = {req};
-    inv(g_send_request, g_aec_instance, send_args);
-}
-
 /* -------------------------------------------------------------------------
  * Quest farming (narrow native slice of QuestRunner)
+ *
+ * No quest ID entry - remembering IDs while working through a chain is
+ * exactly the tedium this should remove. Instead it reads
+ * UIQuestTracker.CurrentQuest, the same static the client itself sets in
+ * ResponseQuestAccept.CurrentQuest = quest (confirmed in the decomp - NOT
+ * Quest.CurrentQuest, a same-named but effectively dead property on a
+ * different class that a reset path nulls alongside the real one). That
+ * means Farm ON acts on whatever is currently tracked, however it got
+ * tracked: something the player tracked from the quest log but has not
+ * accepted yet gets accepted; something already accepted and mid-chain
+ * gets hunted and turned in; and once turned in, whatever the client
+ * tracks NEXT (a chain auto-advancing, or the player tracking a new one by
+ * hand) picks up automatically on the next tick, with no re-toggle needed.
  *
  * Accept a quest, keep auto-hunt running so kill-count objectives progress,
  * and turn in once the quest's own IsReadyForTurnin() says every objective
@@ -1767,17 +1747,19 @@ static void send_cmd(const char *cmd)
  * NPC conversation will sit at "hunting, not ready yet" forever once the
  * kill-only objectives are done - a known, logged gap, not a silent one.
  * ---------------------------------------------------------------------- */
-static void *g_quest_get;                 /* static Quest.Get(int) */
-static void *g_quest_is_ready_turnin;     /* Quest.IsReadyForTurnin() */
-static void *g_player_is_quest_accepted;  /* Player.IsQuestAccepted(int) */
+static void *g_uiquesttracker_get_currentquest; /* static UIQuestTracker.get_CurrentQuest() */
+static void *g_quest_get_id;                    /* Quest.get_ID()                          */
+static void *g_quest_is_ready_turnin;           /* Quest.IsReadyForTurnin()                */
+static void *g_player_is_quest_accepted;        /* Player.IsQuestAccepted(int)             */
 static void *g_req_accept_class;
-static void *g_req_accept_ctor;           /* RequestQuestAccept(int) */
+static void *g_req_accept_ctor;                 /* RequestQuestAccept(int)                 */
 static void *g_req_turnin_class;
-static void *g_req_turnin_ctor;           /* RequestTryQuestComplete(int,int) */
+static void *g_req_turnin_ctor;                 /* RequestTryQuestComplete(int,int)        */
+static int g_quest_last_id;                     /* detects the tracker moving to a new quest */
 
 static void quest_tick(void)
 {
-    if (!g_quest_farm || g_quest_id <= 0) {
+    if (!g_quest_farm || g_uiquesttracker_get_currentquest == NULL) {
         return;
     }
     float now = inv_float(g_time_get_time, NULL, NULL);
@@ -1787,25 +1769,27 @@ static void quest_tick(void)
     g_next_quest_tick = now + 1.0f;
 
     void *player = g_get_main_player ? inv(g_get_main_player, NULL, NULL) : NULL;
-    if (player == NULL || g_quest_get == NULL) {
+    if (player == NULL) {
         return;
     }
 
-    int32_t qid = g_quest_id;
-    void *id_args[1] = {&qid};
-    void *quest = inv(g_quest_get, NULL, id_args);
+    void *quest = inv(g_uiquesttracker_get_currentquest, NULL, NULL);
     if (quest == NULL) {
-        /* Not cached - the client only knows quest defs it has been sent.
-           getQuests populates Quest.Get() for the current map/storyline,
-           same as opening the quest log once would. */
-        if (now >= g_next_getquests_request) {
-            g_next_getquests_request = now + 5.0f;
-            snprintf(g_quest_status, sizeof(g_quest_status), "requesting quest %d (getQuests)",
-                    qid);
-            send_cmd("getQuests");
-        }
+        snprintf(g_quest_status, sizeof(g_quest_status), "no quest tracked - track one in-game");
+        g_quest_last_id = 0;
         return;
     }
+
+    int32_t qid = g_quest_get_id != NULL ? inv_int(g_quest_get_id, quest, NULL) : 0;
+    if (qid != g_quest_last_id) {
+        /* Tracker moved to a different quest - fresh attempt, whether that's
+           chain auto-advance or the player tracking a new one by hand. */
+        g_quest_last_id = qid;
+        g_quest_accept_sent = 0;
+        g_quest_turnin_sent = 0;
+        LOGI("quest: now tracking quest %d", qid);
+    }
+    void *id_args[1] = {&qid};
 
     bool accepted = g_player_is_quest_accepted != NULL &&
                     inv_bool(g_player_is_quest_accepted, player, id_args);
@@ -1843,9 +1827,12 @@ static void quest_tick(void)
             void *send_args[1] = {req};
             inv(g_send_request, g_aec_instance, send_args);
             g_quest_turnin_sent = 1;
-            snprintf(g_quest_status, sizeof(g_quest_status), "quest %d turned in", qid);
+            snprintf(g_quest_status, sizeof(g_quest_status), "quest %d turned in - waiting for "
+                                                              "next tracked quest",
+                    qid);
             LOGI("quest: sent RequestTryQuestComplete(%d, -1)", qid);
-            g_quest_farm = 0; /* one accept->turnin cycle per toggle - see menu comment */
+            /* Farm stays ON: whatever the tracker points to next (chain
+               auto-advance or a manual re-track) picks up on its own. */
         }
     }
 }
@@ -2064,22 +2051,21 @@ static void hook_host_ongui(void *self, void *method)
         g_next_hunt = 0.0f;
     }
 
-    /* Quest farming: accept, hunt (forces Hunt on), turn in once
-       Quest.IsReadyForTurnin() agrees - kill-count objectives only, see the
-       quest farming section's own comment for what this does not cover. */
-    if (gui_button(18, 316, 90, 30, "Quest ID")) {
-        keyboard_open(KB_QUEST);
-    }
-    if (gui_button(114, 316, 90, 30, g_quest_farm ? "Farm: ON" : "Farm: OFF")) {
+    /* Quest farming: no ID entry - acts on whatever UIQuestTracker.CurrentQuest
+       already is. Track/accept a quest normally in-game, then just leave this
+       on; it follows the tracker through however much of a chain keeps
+       getting tracked. Forces Hunt on while a tracked quest isn't ready to
+       turn in yet - kill-count objectives only, see the quest farming
+       section's own comment for what this does not cover. */
+    if (gui_button(18, 316, 160, 30, g_quest_farm ? "Farm: ON" : "Farm: OFF")) {
         g_quest_farm = !g_quest_farm;
         if (g_quest_farm) {
             g_quest_accept_sent = 0;
             g_quest_turnin_sent = 0;
             g_next_quest_tick = 0.0f;
-            g_next_getquests_request = 0.0f;
         }
     }
-    snprintf(buf, sizeof(buf), "quest: %s", g_quest_id > 0 ? g_quest_status : "(no ID set)");
+    snprintf(buf, sizeof(buf), "quest: %s", g_quest_status);
     gui_text(g_gui_label, 18, 352, 326, 24, buf);
 
     /* Packet log, in its own window rather than crowding the tools panel. */
@@ -2289,11 +2275,16 @@ static void setup_menu(void *domain,
        a generic List<string> from native code ourselves. */
     if (g_cs_image != NULL) {
         void *quest_class = class_from_name(g_cs_image, "", "Quest");
+        void *tracker_class = class_from_name(g_cs_image, "", "UIQuestTracker");
         void *player_class = class_from_name(g_cs_image, "", "Player");
         if (quest_class != NULL) {
-            g_quest_get = il2cpp_class_get_method_from_name(quest_class, "Get", 1);
+            g_quest_get_id = il2cpp_class_get_method_from_name(quest_class, "get_ID", 0);
             g_quest_is_ready_turnin =
                 il2cpp_class_get_method_from_name(quest_class, "IsReadyForTurnin", 0);
+        }
+        if (tracker_class != NULL) {
+            g_uiquesttracker_get_currentquest =
+                il2cpp_class_get_method_from_name(tracker_class, "get_CurrentQuest", 0);
         }
         g_player_is_quest_accepted =
             il2cpp_class_get_method_from_name(player_class, "IsQuestAccepted", 1);
@@ -2301,10 +2292,11 @@ static void setup_menu(void *domain,
         g_req_accept_ctor = find_method(g_req_accept_class, ".ctor", 1, 0, NULL);
         g_req_turnin_class = class_from_name(g_cs_image, "", "RequestTryQuestComplete");
         g_req_turnin_ctor = find_method(g_req_turnin_class, ".ctor", 2, 0, NULL);
-        LOGI("menu: quest Get=%p IsReadyForTurnin=%p IsQuestAccepted=%p Accept=%p/%p "
-             "TurnIn=%p/%p",
-             g_quest_get, g_quest_is_ready_turnin, g_player_is_quest_accepted,
-             g_req_accept_class, g_req_accept_ctor, g_req_turnin_class, g_req_turnin_ctor);
+        LOGI("menu: quest CurrentQuest=%p get_ID=%p IsReadyForTurnin=%p IsQuestAccepted=%p "
+             "Accept=%p/%p TurnIn=%p/%p",
+             g_uiquesttracker_get_currentquest, g_quest_get_id, g_quest_is_ready_turnin,
+             g_player_is_quest_accepted, g_req_accept_class, g_req_accept_ctor,
+             g_req_turnin_class, g_req_turnin_ctor);
     }
 
     /* Autoskills: UISkillSlots.GetSlot(int) + SkillSlotButton.UseSkill(bool),
