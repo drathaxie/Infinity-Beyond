@@ -19,6 +19,7 @@
 #include <android/log.h>
 #include <dlfcn.h>
 #include <jni.h>
+#include <math.h>
 #include <pthread.h>
 #include <stdbool.h>
 #include <stdint.h>
@@ -89,6 +90,7 @@ typedef void *(*il2cpp_gchandle_get_target_t)(void *handle);
 typedef void (*il2cpp_gchandle_free_t)(void *handle);
 typedef void *(*il2cpp_class_get_field_from_name_t)(void *klass, const char *name);
 typedef void (*il2cpp_field_get_value_t)(void *obj, void *field, void *out);
+typedef void (*il2cpp_field_static_get_value_t)(void *field, void *out);
 
 static il2cpp_object_unbox_t il2cpp_object_unbox;
 static il2cpp_gchandle_new_t il2cpp_gchandle_new;
@@ -96,6 +98,7 @@ static il2cpp_gchandle_get_target_t il2cpp_gchandle_get_target;
 static il2cpp_gchandle_free_t il2cpp_gchandle_free;
 static il2cpp_class_get_field_from_name_t il2cpp_class_get_field_from_name;
 static il2cpp_field_get_value_t il2cpp_field_get_value;
+static il2cpp_field_static_get_value_t il2cpp_field_static_get_value;
 
 /* The component whose OnGUI we borrow, found by probe_imgui. */
 static void *g_host_class;
@@ -137,6 +140,16 @@ static float inv_float(void *method, void *self, void **args)
     }
     void *raw = il2cpp_object_unbox(boxed);
     return raw != NULL ? *(float *)raw : 0.0f;
+}
+
+static int inv_int(void *method, void *self, void **args)
+{
+    void *boxed = inv(method, self, args);
+    if (boxed == NULL || !il2cpp_object_unbox) {
+        return -1;
+    }
+    void *raw = il2cpp_object_unbox(boxed);
+    return raw != NULL ? *(int32_t *)raw : -1;
 }
 
 /* Managed strings move and are collected, so anything held across frames needs
@@ -819,13 +832,227 @@ static bool skill_on_cooldown(void *btn)
     return false;
 }
 
+/* -------------------------------------------------------------------------
+ * Auto-hunt
+ *
+ * Farms whatever hostile is nearest in the loaded map: target it the same
+ * way a player click does (Targetable.ClickMe() x2 - first assigns target,
+ * second triggers chargeAuto() -> Charge(0) -> RequestStartCharge), walk
+ * toward it if out of engage range, and leave autoskills (already gated on
+ * cooldown/disabled) to handle the actual casting once in range.
+ *
+ * Deliberately no A* here yet - straight-line EntityMovementUpdater.walkTo,
+ * same as the desktop agent before PathWalker existed. A charge that dies on
+ * a Blocker collider is a known, accepted gap for this first pass; wall-aware
+ * pathing is a separate, larger follow-on (PathWalker.cs's own A* + Physics2D
+ * raycasts), not a blocker for hunting in an open cell.
+ * ---------------------------------------------------------------------- */
+static void *g_entity_getgameobject;    /* Entity.getGameObject()          (0-arg) */
+static void *g_entity_get_target;       /* Entity.get_target()             (0-arg) */
+static void *g_go_get_transform;        /* GameObject.get_transform()      (0-arg) */
+static void *g_go_getcomponent;         /* GameObject.GetComponent(Type)   (1-arg) */
+static void *g_transform_get_localpos;  /* Transform.get_localPosition()   (0-arg) */
+static void *g_targetable_class;
+static void *g_targetable_type_obj;     /* cached Type object for GetComponent(Type) */
+static void *g_targetable_clickme;
+static void *g_emu_class;
+static void *g_emu_type_obj;
+static void *g_emu_walkto;              /* EntityMovementUpdater.walkTo(Vector3,float) */
+static void *g_emu_cellspeed_field;     /* static int */
+static int g_hunt;
+static float g_next_hunt;
+static float g_max_engage_dist = 9.0f;  /* matches QuestRunner.MaxEngageDist */
+
+/* Shared with the nameplate spoof further down, which also needs the local
+   player - resolved once in setup_menu. */
+static void *g_get_main_player;
+
+/* Shared with probe_monsters() below, which does the actual resolution (it
+   runs first every tick - see hook_aec_update) and the same generic-
+   dictionary walk technique, just counting instead of picking a winner. */
+static void *g_area_currentarea_field;
+static void *g_area_monsters_field;
+static void *g_monster_reaction_field;
+static void *g_entity_get_name;           /* resolved on Monster - see probe_monsters */
+static void *g_entity_get_currentstate;   /* resolved on Entity - Monster doesn't override it */
+
+/* Local-space player/target position, as a 3-float unboxed struct - same
+   unbox-a-boxed-return pattern already proven for KeyValuePair in
+   probe_monsters. NULL on any failure (no GameObject yet, no Transform, …). */
+static bool read_local_pos(void *entity, float out[3])
+{
+    if (entity == NULL || g_entity_getgameobject == NULL || g_go_get_transform == NULL ||
+        g_transform_get_localpos == NULL || !il2cpp_object_unbox) {
+        return false;
+    }
+    void *go = inv(g_entity_getgameobject, entity, NULL);
+    void *tr = go ? inv(g_go_get_transform, go, NULL) : NULL;
+    void *boxed_pos = tr ? inv(g_transform_get_localpos, tr, NULL) : NULL;
+    float *raw = boxed_pos ? (float *)il2cpp_object_unbox(boxed_pos) : NULL;
+    if (raw == NULL) {
+        return false;
+    }
+    out[0] = raw[0];
+    out[1] = raw[1];
+    out[2] = raw[2];
+    return true;
+}
+
+/* GameObject.GetComponent(Type) - the same non-generic overload setup_menu
+   already uses for AddComponent(Type), since the generic GetComponent<T>()
+   needs a resolved generic instantiation this shim has no path to. */
+static void *get_component(void *go, void *type_obj)
+{
+    if (go == NULL || type_obj == NULL || g_go_getcomponent == NULL) {
+        return NULL;
+    }
+    void *args[1] = {type_obj};
+    return inv(g_go_getcomponent, go, args);
+}
+
+/* Nearest live hostile in Area.currentArea.Monsters, by 2D distance to the
+   player. Reuses the same field/method handles probe_monsters resolved -
+   this is the same generic-dictionary walk, just picking a winner instead of
+   just counting. Returns NULL if nothing hostile is loaded. */
+static void *find_nearest_hostile(void *player, const float me[3])
+{
+    if (g_area_currentarea_field == NULL || g_area_monsters_field == NULL ||
+        g_monster_reaction_field == NULL || !il2cpp_field_static_get_value) {
+        return NULL;
+    }
+    void *area = NULL;
+    il2cpp_field_static_get_value(g_area_currentarea_field, &area);
+    if (area == NULL) {
+        return NULL;
+    }
+    void *dict = NULL;
+    il2cpp_field_get_value(area, g_area_monsters_field, &dict);
+    if (dict == NULL) {
+        return NULL;
+    }
+    void *dict_class = il2cpp_object_get_class(dict);
+    void *get_enumerator = il2cpp_class_get_method_from_name(dict_class, "GetEnumerator", 0);
+    void *boxed_enum = get_enumerator ? inv(get_enumerator, dict, NULL) : NULL;
+    void *enum_raw = boxed_enum ? il2cpp_object_unbox(boxed_enum) : NULL;
+    if (enum_raw == NULL) {
+        return NULL;
+    }
+    void *enum_class = il2cpp_object_get_class(boxed_enum);
+    void *move_next = il2cpp_class_get_method_from_name(enum_class, "MoveNext", 0);
+    void *get_current = il2cpp_class_get_method_from_name(enum_class, "get_Current", 0);
+    if (move_next == NULL || get_current == NULL) {
+        return NULL;
+    }
+
+    void *best = NULL;
+    float best_dist2 = 0.0f;
+    for (int i = 0; i < 500 && inv_bool(move_next, enum_raw, NULL); i++) {
+        void *boxed_kv = inv(get_current, enum_raw, NULL);
+        void *kv_raw = boxed_kv ? il2cpp_object_unbox(boxed_kv) : NULL;
+        if (kv_raw == NULL) {
+            continue;
+        }
+        void *kv_class = il2cpp_object_get_class(boxed_kv);
+        void *get_value = il2cpp_class_get_method_from_name(kv_class, "get_Value", 0);
+        void *mon = get_value ? inv(get_value, kv_raw, NULL) : NULL;
+        if (mon == NULL || mon == player) {
+            continue;
+        }
+        int32_t reaction = 0;
+        il2cpp_field_get_value(mon, g_monster_reaction_field, &reaction);
+        if (reaction != 1) { /* not Hostile */
+            continue;
+        }
+        if (g_entity_get_currentstate != NULL &&
+            inv_int(g_entity_get_currentstate, mon, NULL) == 0) { /* State.Dead */
+            continue;
+        }
+        float pos[3];
+        if (!read_local_pos(mon, pos)) {
+            continue;
+        }
+        float dx = pos[0] - me[0], dy = pos[1] - me[1];
+        float d2 = dx * dx + dy * dy;
+        if (best == NULL || d2 < best_dist2) {
+            best = mon;
+            best_dist2 = d2;
+        }
+    }
+    return best;
+}
+
+static void hunt_tick(void)
+{
+    if (!g_hunt || g_get_main_player == NULL) {
+        return;
+    }
+    float now = inv_float(g_time_get_time, NULL, NULL);
+    if (now < g_next_hunt) {
+        return;
+    }
+    g_next_hunt = now + 0.3f;
+
+    void *player = inv(g_get_main_player, NULL, NULL);
+    if (player == NULL) {
+        return;
+    }
+    float me[3];
+    if (!read_local_pos(player, me)) {
+        return;
+    }
+
+    void *tgt = find_nearest_hostile(player, me);
+    if (tgt == NULL) {
+        return; /* nothing hostile loaded - wait for one to spawn/appear */
+    }
+
+    float tp[3];
+    if (!read_local_pos(tgt, tp)) {
+        return;
+    }
+    float dx = tp[0] - me[0], dy = tp[1] - me[1];
+    float dist = sqrtf(dx * dx + dy * dy);
+
+    /* Engage: mirrors a player click on the target - first ClickMe() assigns
+       target, second fires the charge. Only re-issue when the target actually
+       changed; the setter no-ops on an unchanged/dead value anyway, but
+       skipping the two managed calls entirely when nothing changed is cheap
+       and avoids re-triggering the charge animation every 0.3s. */
+    void *current_target = g_entity_get_target ? inv(g_entity_get_target, player, NULL) : NULL;
+    if (current_target != tgt && g_targetable_type_obj != NULL) {
+        void *tgt_go = inv(g_entity_getgameobject, tgt, NULL);
+        void *targetable = get_component(tgt_go, g_targetable_type_obj);
+        if (targetable != NULL && g_targetable_clickme != NULL) {
+            inv(g_targetable_clickme, targetable, NULL);
+            inv(g_targetable_clickme, targetable, NULL);
+        }
+    }
+
+    if (dist > g_max_engage_dist && g_emu_type_obj != NULL && g_emu_walkto != NULL) {
+        void *player_go = inv(g_entity_getgameobject, player, NULL);
+        void *emu = get_component(player_go, g_emu_type_obj);
+        if (emu != NULL) {
+            float speed = 14.0f;
+            if (g_emu_cellspeed_field != NULL && il2cpp_field_static_get_value) {
+                int32_t cs = 14;
+                il2cpp_field_static_get_value(g_emu_cellspeed_field, &cs);
+                speed = (float)cs;
+            }
+            void *args[2] = {tp, &speed};
+            inv(g_emu_walkto, emu, args);
+        }
+    }
+
+    /* Combat is autoskills' job; hunting just keeps a live target in range. */
+    g_autoskills = 1;
+}
+
 /* Nameplate spoof.
    RefreshNameplate() is a dead end: it looks for a TextMeshProUGUI on the
    nameplate root, but the root carries a NameplateView and the text lives on
    children, so it finds nothing and silently does nothing. The live path is
    Player.nameTagView.SetName()/SetTitle(), which is what createNameTag itself
    calls. */
-static void *g_get_main_player;
 static void *g_nametagview_field;
 static void *g_view_set_name;
 static void *g_view_set_title;
@@ -864,16 +1091,6 @@ static const char *const CMDS[] = {
 };
 #define CMD_COUNT ((int)(sizeof(CMDS) / sizeof(CMDS[0])))
 #define HELP_ROWS 10
-
-static int inv_int(void *method, void *self, void **args)
-{
-    void *boxed = inv(method, self, args);
-    if (boxed == NULL || !il2cpp_object_unbox) {
-        return -1;
-    }
-    void *raw = il2cpp_object_unbox(boxed);
-    return raw != NULL ? *(int32_t *)raw : -1;
-}
 
 /* Rect is a value type, so runtime_invoke wants a pointer to the raw floats. */
 static void gui_text(void *method, float x, float y, float w, float h, const char *text)
@@ -1134,7 +1351,7 @@ static void hook_host_ongui(void *self, void *method)
 
     char buf[128];
     snprintf(buf, sizeof(buf), "Beyond - packets %d", g_pkt_total);
-    gui_text(g_gui_box, 8, 44, 344, 252, buf);
+    gui_text(g_gui_box, 8, 44, 344, 288, buf);
 
     if (gui_button(18, 78, 152, 30, g_block_incoming ? "Block: ON" : "Block: OFF")) {
         g_block_incoming = !g_block_incoming;
@@ -1185,6 +1402,14 @@ static void hook_host_ongui(void *self, void *method)
     snprintf(buf, sizeof(buf), "as: %s / %s", g_spoof[0] ? g_spoof : "(real)",
              g_title[0] ? g_title : "(real)");
     gui_text(g_gui_label, 18, 248, 326, 24, buf);
+
+    /* Auto-hunt: nearest hostile, straight-line approach, no A* yet - see the
+       auto-hunt section's own comment for scope. Shares the cadence with
+       autoskills so combat starts as soon as a target is in range. */
+    if (gui_button(18, 280, 160, 30, g_hunt ? "Hunt: ON" : "Hunt: OFF")) {
+        g_hunt = !g_hunt;
+        g_next_hunt = 0.0f;
+    }
 
     /* Packet log, in its own window rather than crowding the tools panel. */
     if (g_log_open) {
@@ -1464,6 +1689,40 @@ static void setup_menu(void *domain,
              "Name=%p/%p Title=%p",
              g_get_main_player, view, g_nametagview_field, g_view_set_name, g_view_set_title,
              g_view_set_title_visible, g_get_name, g_name_field, g_title_field);
+
+        /* Auto-hunt bindings: targeting (Targetable.ClickMe), movement
+           (EntityMovementUpdater.walkTo) and position reads (Transform).
+           GetComponent(Type) needs a cached Type object per component type -
+           the same AddComponent(Type) pattern the menu's own host component
+           uses below. */
+        g_entity_getgameobject = find_method(entity, "getGameObject", 0, 0, NULL);
+        g_entity_get_target = find_method(entity, "get_target", 0, 0, NULL);
+        void *transform_class = class_from_name(core_image, "UnityEngine", "Transform");
+        g_go_get_transform = find_method(go_class, "get_transform", 0, 0, NULL);
+        g_go_getcomponent = find_method(go_class, "GetComponent", 1, 0, "Type");
+        g_transform_get_localpos = find_method(transform_class, "get_localPosition", 0, 0, NULL);
+
+        g_targetable_class = class_from_name(g_cs_image, "", "Targetable");
+        g_targetable_clickme = find_method(g_targetable_class, "ClickMe", 0, 0, NULL);
+        if (g_targetable_class != NULL) {
+            g_targetable_type_obj =
+                il2cpp_type_get_object(il2cpp_class_get_type(g_targetable_class));
+        }
+
+        g_emu_class = class_from_name(g_cs_image, "", "EntityMovementUpdater");
+        g_emu_walkto = find_method(g_emu_class, "walkTo", 2, 0, NULL);
+        if (g_emu_class != NULL) {
+            g_emu_type_obj = il2cpp_type_get_object(il2cpp_class_get_type(g_emu_class));
+            if (il2cpp_class_get_field_from_name) {
+                g_emu_cellspeed_field = il2cpp_class_get_field_from_name(g_emu_class, "cellSpeed");
+            }
+        }
+        LOGI("menu: hunt getGameObject=%p get_target=%p get_transform=%p GetComponent=%p "
+             "get_localPosition=%p Targetable=%p/%p/%p EMU=%p/%p/%p/%p",
+             g_entity_getgameobject, g_entity_get_target, g_go_get_transform, g_go_getcomponent,
+             g_transform_get_localpos, g_targetable_class, g_targetable_type_obj,
+             g_targetable_clickme, g_emu_class, g_emu_type_obj, g_emu_walkto,
+             g_emu_cellspeed_field);
     }
 
     void *go = il2cpp_object_new(go_class);
@@ -1514,12 +1773,164 @@ static il2cpp_domain_assembly_open_t g_assembly_open;
 static il2cpp_assembly_get_image_t g_assembly_image;
 static il2cpp_class_from_name_t g_class_from_name;
 
+/* -------------------------------------------------------------------------
+ * Monster dictionary probe (one-shot, diagnostic)
+ *
+ * Load-bearing question for any hunt/quest logic: can this shim walk a
+ * generic Dictionary<int, Monster> - Area.currentArea.Monsters, straight off
+ * the PC decomp - from native code? Nothing else in the shim has touched a
+ * generic collection; every field/method so far has been on a plain type.
+ * IL2CPP compiles each closed generic instantiation as its own concrete
+ * class with its own vtable, so the plan is: read the field to get the
+ * dictionary object, ask ITS class (not Dictionary<,> itself) for
+ * GetEnumerator, then invoke MoveNext/get_Current against the UNBOXED
+ * struct pointer - il2cpp_runtime_invoke's convention for a value-type
+ * instance method is the address of the unboxed value, not the boxed
+ * object handed back by a prior invoke. Same reasoning applies to reading
+ * Key/Value off the boxed KeyValuePair<int,Monster> that get_Current
+ * returns. Logged at every step so a wrong guess is diagnosable instead of
+ * a silent zero.
+ *
+ * Retried every 2s (Time.get_time-gated, like spoof_tick) since
+ * Area.currentArea is null until a map is actually loaded - failing before
+ * that is expected, not a bug. Resolution (classes/fields/methods) happens
+ * once; the walk itself retries indefinitely so live monster count/roster
+ * tracks reality instead of freezing at whatever the first successful read
+ * saw.
+ * ---------------------------------------------------------------------- */
+static float g_next_monster_probe;
+static int g_monster_probe_resolved;   /* class/field/method lookups - these don't change */
+static int g_monster_probe_fatal;      /* a lookup genuinely failed; no point retrying */
+
+static void probe_monsters(void)
+{
+    if (g_monster_probe_fatal || g_cs_image == NULL || g_class_from_name == NULL) {
+        return;
+    }
+    float now = inv_float(g_time_get_time, NULL, NULL);
+    if (now < g_next_monster_probe) {
+        return;
+    }
+    g_next_monster_probe = now + 2.0f;
+
+    if (!g_monster_probe_resolved) {
+        void *area_class = g_class_from_name(g_cs_image, "", "Area");
+        void *monster_class = g_class_from_name(g_cs_image, "", "Monster");
+        void *entity_class = g_class_from_name(g_cs_image, "", "Entity");
+        if (area_class == NULL || monster_class == NULL || entity_class == NULL ||
+            !il2cpp_class_get_field_from_name || !il2cpp_field_static_get_value ||
+            !il2cpp_object_unbox || !il2cpp_object_get_class) {
+            LOGE("monster probe: Area=%p Monster=%p Entity=%p - class/API lookup incomplete",
+                 area_class, monster_class, entity_class);
+            g_monster_probe_fatal = 1;
+            return;
+        }
+        g_area_currentarea_field = il2cpp_class_get_field_from_name(area_class, "currentArea");
+        g_area_monsters_field = il2cpp_class_get_field_from_name(area_class, "Monsters");
+        g_monster_reaction_field =
+            il2cpp_class_get_field_from_name(monster_class, "reactionType");
+        /* Name is declared virtual on Entity, but unlike Player (which
+           inherits it as-is), Monster overrides it with its own backing
+           field - per the decomp, `public override string Name { get; set; }`.
+           il2cpp_runtime_invoke calls the exact MethodInfo handed to it; it
+           does not walk the vtable the way a C# virtual call would. Resolving
+           this on Entity and invoking it on a Monster instance compiles and
+           returns cleanly, but silently reads Entity's own never-set backing
+           field - empty string, no exception, no hint anything is wrong. So
+           resolve on Monster's own class, where the override actually lives. */
+        g_entity_get_name = il2cpp_class_get_method_from_name(monster_class, "get_Name", 0);
+        /* currentState is NOT overridden by Monster (only Name is, per the
+           decomp), so resolving it on Entity is safe here - unlike get_Name
+           above, there's no derived-class override to miss. */
+        g_entity_get_currentstate =
+            il2cpp_class_get_method_from_name(entity_class, "get_currentState", 0);
+        LOGI("monster probe: currentArea field=%p Monsters field=%p reactionType field=%p "
+             "get_Name=%p get_currentState=%p",
+             g_area_currentarea_field, g_area_monsters_field, g_monster_reaction_field,
+             g_entity_get_name, g_entity_get_currentstate);
+        if (g_area_currentarea_field == NULL || g_area_monsters_field == NULL) {
+            g_monster_probe_fatal = 1;
+            return;
+        }
+        g_monster_probe_resolved = 1;
+    }
+
+    void *area = NULL;
+    il2cpp_field_static_get_value(g_area_currentarea_field, &area);
+    if (area == NULL) {
+        LOGI("monster probe: Area.currentArea is null - no map loaded, retrying");
+        return;
+    }
+
+    void *dict = NULL;
+    il2cpp_field_get_value(area, g_area_monsters_field, &dict);
+    if (dict == NULL) {
+        LOGI("monster probe: currentArea=%p but Monsters dict is null, retrying", area);
+        return;
+    }
+
+    void *dict_class = il2cpp_object_get_class(dict);
+    void *get_enumerator = il2cpp_class_get_method_from_name(dict_class, "GetEnumerator", 0);
+    void *boxed_enum = get_enumerator ? inv(get_enumerator, dict, NULL) : NULL;
+    if (boxed_enum == NULL) {
+        LOGE("monster probe: dict class=%p GetEnumerator=%p returned null, retrying", dict_class,
+             get_enumerator);
+        return;
+    }
+    void *enum_raw = il2cpp_object_unbox(boxed_enum);
+    void *enum_class = il2cpp_object_get_class(boxed_enum);
+    void *move_next = il2cpp_class_get_method_from_name(enum_class, "MoveNext", 0);
+    void *get_current = il2cpp_class_get_method_from_name(enum_class, "get_Current", 0);
+    if (enum_raw == NULL || move_next == NULL || get_current == NULL) {
+        LOGE("monster probe: enumerator raw=%p MoveNext=%p get_Current=%p - giving up", enum_raw,
+             move_next, get_current);
+        g_monster_probe_fatal = 1;
+        return;
+    }
+
+    int count = 0, hostile = 0;
+    char sample[96] = "";
+    for (int i = 0; i < 500 && inv_bool(move_next, enum_raw, NULL); i++) {
+        count++;
+        void *boxed_kv = inv(get_current, enum_raw, NULL);
+        if (boxed_kv == NULL) {
+            continue;
+        }
+        void *kv_raw = il2cpp_object_unbox(boxed_kv);
+        void *kv_class = il2cpp_object_get_class(boxed_kv);
+        void *get_value = kv_raw ? il2cpp_class_get_method_from_name(kv_class, "get_Value", 0)
+                                 : NULL;
+        void *mon = get_value ? inv(get_value, kv_raw, NULL) : NULL;
+        if (mon == NULL) {
+            continue;
+        }
+        if (g_monster_reaction_field != NULL) {
+            int32_t reaction = 0;
+            il2cpp_field_get_value(mon, g_monster_reaction_field, &reaction);
+            if (reaction == 1) { /* ReactionType.Hostile, per the decomp enum */
+                hostile++;
+            }
+        }
+        if (count <= 5 && g_entity_get_name != NULL) {
+            char nm[40];
+            mstr_to_utf8(inv(g_entity_get_name, mon, NULL), nm, sizeof(nm));
+            size_t used = strlen(sample);
+            snprintf(sample + used, sizeof(sample) - used, "%s%s", used ? ", " : "", nm);
+        }
+    }
+
+    LOGI("monster probe: RESULT %d monster(s), %d hostile - sample: %s", count, hostile,
+         sample[0] ? sample : "(none)");
+}
+
 static void *hook_aec_update(void *a0, void *a1)
 {
     void *r = orig_aec_update(a0, a1);
     g_aec_instance = a0; /* AEC.Update is an instance method: a0 is the AEC */
     autoskills_tick();
     spoof_tick();
+    hunt_tick();
+    probe_monsters();
     if (!g_ui_ready) {
         g_ui_ready = 1; /* set first: a failed setup must not retry every frame */
         setup_menu(g_domain, g_assembly_open, g_assembly_image, g_class_from_name);
@@ -1594,6 +2005,8 @@ static void *beyond_thread(void *arg)
     il2cpp_class_get_field_from_name =
         (il2cpp_class_get_field_from_name_t)dlsym(lib, "il2cpp_class_get_field_from_name");
     il2cpp_field_get_value = (il2cpp_field_get_value_t)dlsym(lib, "il2cpp_field_get_value");
+    il2cpp_field_static_get_value =
+        (il2cpp_field_static_get_value_t)dlsym(lib, "il2cpp_field_static_get_value");
 
     if (!domain_get || !thread_attach || !assembly_open || !assembly_image ||
         !class_from_name || !il2cpp_class_get_method_from_name || !il2cpp_object_get_class ||
