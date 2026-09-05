@@ -49,7 +49,6 @@ typedef void *(*il2cpp_runtime_invoke_t)(void *method, void *obj, void **params,
 typedef uint16_t *(*il2cpp_string_chars_t)(void *str);
 typedef int32_t (*il2cpp_string_length_t)(void *str);
 typedef void **(*il2cpp_domain_get_assemblies_t)(void *domain, size_t *size);
-typedef uint32_t (*il2cpp_array_length_t)(void *array);
 typedef size_t (*il2cpp_image_get_class_count_t)(void *image);
 typedef void *(*il2cpp_image_get_class_t)(void *image, size_t index);
 typedef void *(*il2cpp_class_get_methods_t)(void *klass, void **iter);
@@ -468,56 +467,6 @@ static void *hook_get_response(void *a0, void *a1)
         }
     }
     return response;
-}
-
-/* -------------------------------------------------------------------------
- * TEMPORARY: raw getQuests dump.
- *
- * The quest-chain IDs shipped so far were pulled from InfinityServer's OWN
- * questdb - a different server with its own numbering - which is why
- * players are getting kicked for an invalid quest ID against live AE. The
- * only place live AE's real quest IDs/names/prevQuest links exist is the
- * getQuests response itself, and there is no REST equivalent (confirmed:
- * AE's catalog REST endpoints cover asset bundles/monsters/soundtracks, not
- * quest defs - those are socket-only). log_packet only ever sees the
- * ALREADY-DESERIALIZED Response object, so this hooks one level earlier,
- * the same point the desktop sniffer's AECWrapAndQueueResponsePatch reads
- * raw JSON from - AEC.WrapAndQueueResponse(byte[] data), before it becomes
- * a typed object at all - and dumps anything that looks quest-related
- * straight to logcat, chunked under logcat's per-line limit. Remove once
- * real chain data replaces the placeholders this is meant to unblock. */
-static void *(*orig_wrap_and_queue)(void *self, void *data, void *method);
-static void *g_encoding_utf8_instance; /* System.Text.Encoding.UTF8 (static property value) */
-static void *g_encoding_getstring;     /* Encoding.GetString(byte[]) */
-
-static void *hook_wrap_and_queue(void *self, void *data, void *method)
-{
-    if (data != NULL && g_encoding_utf8_instance != NULL && g_encoding_getstring != NULL) {
-        void *args[1] = {data};
-        void *managed_str = inv(g_encoding_getstring, g_encoding_utf8_instance, args);
-        if (managed_str != NULL) {
-            static char buf[16384];
-            mstr_to_utf8(managed_str, buf, sizeof(buf));
-            size_t total_len = strlen(buf);
-            /* First pass: filter unknown - log a short prefix of EVERYTHING so
-               the real field names/Cmd string are visible, then narrow. Loose
-               on purpose (quest/Quest/prevQuest/storyline all match) since we
-               do not yet know which one the wire actually uses. */
-            bool looks_relevant = strstr(buf, "uest") != NULL || strstr(buf, "toryline") != NULL;
-            LOGI("QDIAG len=%zu relevant=%d prefix=%.160s", total_len, looks_relevant, buf);
-            if (looks_relevant) {
-                size_t len = total_len;
-                for (size_t off = 0; off < len; off += 900) {
-                    char chunk[920];
-                    size_t n = len - off < 900 ? len - off : 900;
-                    memcpy(chunk, buf + off, n);
-                    chunk[n] = '\0';
-                    LOGI("QUESTDUMP[%zu/%zu]: %s", off, len, chunk);
-                }
-            }
-        }
-    }
-    return orig_wrap_and_queue(self, data, method);
 }
 
 /* -------------------------------------------------------------------------
@@ -1866,6 +1815,9 @@ static float g_next_getquests_request;          /* chain mode: retry cadence whi
    this adds Interact and Apop/Talk. Cutscene is not covered - logged as
    such rather than silently stalling. */
 static void *g_quest_turnins_field;    /* Quest.Turnins (QuestTurninItem[]) */
+static void *g_system_array_class;     /* System.Array - see next_incomplete_objective()'s own
+                                          comment for why GetEnumerator has to be resolved here
+                                          rather than on the array's own concrete class */
 static void *g_qti_qoid_field;
 static void *g_qti_qotype_field;
 static void *g_qti_getrefint_method;   /* QuestTurninItem.GetRefInt(int) - avoids ever
@@ -2005,8 +1957,23 @@ static void *next_incomplete_objective(void *quest, void *player, int32_t *qotyp
         return NULL;
     }
 
-    void *arr_class = il2cpp_object_get_class(turnins);
-    void *get_enumerator = il2cpp_class_get_method_from_name(arr_class, "GetEnumerator", 0);
+    /* QuestTurninItem[]'s own concrete class does not declare GetEnumerator
+       itself - arrays get it from System.Array, and il2cpp_class_get_method
+       _from_name only searches a class's OWN declared methods, not inherited
+       ones (the same rule that made resolving get_Name on Entity read the
+       wrong backing field for Monster earlier). Confirmed on device: this
+       returned NULL for every quest, silently treating a quest with a real
+       incomplete Killcount objective as having nothing actionable - the bot
+       fell back to blind hunting and only completed by luck (monsters
+       happened to be in the starting room). Resolving GetEnumerator on
+       System.Array instead - the class that actually declares it - and
+       invoking on the array instance is the fix; everything past that point
+       (the returned enumerator's OWN concrete class, unboxed the same way
+       the Monsters dictionary walk already does) is unchanged. */
+    void *get_enumerator = g_system_array_class != NULL
+                              ? il2cpp_class_get_method_from_name(g_system_array_class,
+                                                                  "GetEnumerator", 0)
+                              : NULL;
     void *boxed_enum = get_enumerator ? inv(get_enumerator, turnins, NULL) : NULL;
     void *enum_raw = boxed_enum ? il2cpp_object_unbox(boxed_enum) : NULL;
     if (enum_raw == NULL) {
@@ -2837,6 +2804,12 @@ static void setup_menu(void *domain,
         void *npcbutton_class = class_from_name(g_cs_image, "", "NPCButton");
         void *component_class = class_from_name(core_image, "UnityEngine", "Component");
         void *tf_class = class_from_name(core_image, "UnityEngine", "Transform");
+        void *mscorlib_asm = assembly_open(domain, "mscorlib");
+        if (mscorlib_asm != NULL) {
+            g_system_array_class = class_from_name(assembly_image(mscorlib_asm), "System",
+                                                   "Array");
+        }
+        LOGI("menu: objectives System.Array=%p", g_system_array_class);
 
         if (quest_class != NULL) {
             g_quest_turnins_field = il2cpp_class_get_field_from_name
@@ -3381,27 +3354,6 @@ static void *beyond_thread(void *arg)
     if (hook_func("AEC.GetResponse", code, (void *)hook_get_response,
                   (void **)&orig_get_response)) {
         LOGI("hooked AEC.GetResponse - logging packets");
-    }
-
-    /* TEMPORARY diagnostic - see hook_wrap_and_queue's own comment. */
-    void *wrap_method = il2cpp_class_get_method_from_name(aec, "WrapAndQueueResponse", 1);
-    void *wrap_code = wrap_method ? method_code_ptr(wrap_method) : NULL;
-    if (wrap_code != NULL &&
-        hook_func("AEC.WrapAndQueueResponse", wrap_code, (void *)hook_wrap_and_queue,
-                  (void **)&orig_wrap_and_queue)) {
-        void *mscorlib = assembly_open(domain, "mscorlib");
-        void *encoding_class = mscorlib
-                                   ? class_from_name(assembly_image(mscorlib), "System.Text",
-                                                     "Encoding")
-                                   : NULL;
-        if (encoding_class != NULL) {
-            void *get_utf8 = il2cpp_class_get_method_from_name(encoding_class, "get_UTF8", 0);
-            g_encoding_utf8_instance = get_utf8 ? inv(get_utf8, NULL, NULL) : NULL;
-            g_encoding_getstring =
-                il2cpp_class_get_method_from_name(encoding_class, "GetString", 1);
-        }
-        LOGI("quest dump: mscorlib=%p Encoding=%p UTF8=%p GetString=%p", mscorlib,
-             encoding_class, g_encoding_utf8_instance, g_encoding_getstring);
     }
 
     /* Probes run after the hook so a probe failure cannot cost us packet
