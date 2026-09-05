@@ -786,10 +786,49 @@ static int g_kb_target;    /* which buffer the open keyboard writes into */
 #define KB_SPOOF 1
 #define KB_TITLE 2
 
-/* Quest-farm state, read/written by quest_tick() further down. No ID entry -
-   it acts on whatever UIQuestTracker.CurrentQuest already is; see that
-   function's own comment for why. */
-static int g_quest_farm;
+/* Named quest chains: starting quest ID + map/frame/pad, and the full
+   ID sequence a chain follows (quest N+1 = whichever quest has
+   prevQuest == N), pulled directly from InfinityServer's own questdb via
+   the same logic scripts/export_beyond_chains.py uses - not guessed, and
+   not re-derived on-device (no prevQuest-walking here at all; the whole
+   sequence is just baked in, which is simpler and does not depend on
+   whether the client happens to auto-track the next storyline quest).
+   Zard Killer's pad in the DB carries a stray leading tab - normalized to
+   "Spawn" here rather than reproduced literally. */
+typedef struct {
+    const char *name;
+    const char *map;
+    const char *frame;
+    const char *pad;
+    const int32_t *ids;
+    int count;
+} ChainDef;
+
+static const int32_t CHAIN_LAIR[] = {19, 20, 40, 41, 42, 43, 44, 45, 46, 47, 59};
+static const int32_t CHAIN_BLUDRUT[] = {157, 120, 149, 121, 122, 119, 123, 124, 125, 164, 127,
+                                        158, 150, 129, 130, 163, 132, 151, 152, 133, 134, 135,
+                                        136, 137, 138, 153, 154, 139, 140, 166, 142, 143, 144,
+                                        146, 148};
+static const int32_t CHAIN_ZARD[] = {185, 193, 194, 195, 196, 197, 198, 199};
+static const int32_t CHAIN_FOREST[] = {236, 237, 238, 239, 240, 241, 242, 243, 244};
+
+static const ChainDef CHAINS[] = {
+    {"Lair", "lair", "Enter", "Down", CHAIN_LAIR, 11},
+    {"Bludrut Keep", "bludrut", "Enter", "Spawn", CHAIN_BLUDRUT, 35},
+    {"Zard Killer", "riverquest", "Enter", "Spawn", CHAIN_ZARD, 8},
+    {"Forest Zards", "forest", "Enter", "Spawn", CHAIN_FOREST, 9},
+};
+#define CHAIN_COUNT ((int)(sizeof(CHAINS) / sizeof(CHAINS[0])))
+
+/* Quest-farm state, read/written by quest_tick() further down.
+   g_quest_mode: 0 = off, 1 = follow whatever UIQuestTracker.CurrentQuest
+   already is (no ID entry - track/accept normally in-game), 2..(1+N) = the
+   Nth entry of CHAINS, run start to finish off the baked-in ID list rather
+   than the live tracker. One button cycles through all of these - see the
+   menu draw code - rather than growing a button per chain. */
+static int g_quest_mode;
+static int g_chain_index;
+static int g_chain_tfer_sent;
 static float g_next_quest_tick;
 static int g_quest_accept_sent;
 static int g_quest_turnin_sent;
@@ -1748,6 +1787,7 @@ static void send_typed_packet(void)
  * kill-only objectives are done - a known, logged gap, not a silent one.
  * ---------------------------------------------------------------------- */
 static void *g_uiquesttracker_get_currentquest; /* static UIQuestTracker.get_CurrentQuest() */
+static void *g_quest_get;                       /* static Quest.Get(int) - chain mode only */
 static void *g_quest_get_id;                    /* Quest.get_ID()                          */
 static void *g_quest_is_ready_turnin;           /* Quest.IsReadyForTurnin()                */
 static void *g_player_is_quest_accepted;        /* Player.IsQuestAccepted(int)             */
@@ -1755,7 +1795,10 @@ static void *g_req_accept_class;
 static void *g_req_accept_ctor;                 /* RequestQuestAccept(int)                 */
 static void *g_req_turnin_class;
 static void *g_req_turnin_ctor;                 /* RequestTryQuestComplete(int,int)        */
-static int g_quest_last_id;                     /* detects the tracker moving to a new quest */
+static void *g_req_transfer_class;
+static void *g_req_transfer_ctor;               /* RequestMoveToArea(string,string,string,string,string) */
+static int g_quest_last_id;                     /* detects the target moving to a new quest */
+static float g_next_getquests_request;          /* chain mode: retry cadence while Quest.Get(id) is null */
 
 /* Objective dispatch: which incomplete QuestTurninItem to act on, and how.
    QuestObjectiveType (decomp): Turnin=0, Killcount=1, Interact=2, Talk=3,
@@ -1973,7 +2016,7 @@ static void *current_cell_transform(void *player)
 
 static void quest_tick(void)
 {
-    if (!g_quest_farm || g_uiquesttracker_get_currentquest == NULL) {
+    if (g_quest_mode == 0) {
         return;
     }
     float now = inv_float(g_time_get_time, NULL, NULL);
@@ -1987,21 +2030,86 @@ static void quest_tick(void)
         return;
     }
 
-    void *quest = inv(g_uiquesttracker_get_currentquest, NULL, NULL);
-    if (quest == NULL) {
-        snprintf(g_quest_status, sizeof(g_quest_status), "no quest tracked - track one in-game");
-        g_quest_last_id = 0;
-        return;
+    /* Target resolution: mode 1 reads whatever is live-tracked in-game;
+       chain mode (2+) reads a fixed ID off the baked-in CHAINS table. Once
+       target_id/quest are set, everything below (accept/dispatch/turn-in)
+       is identical for both. */
+    int32_t qid = 0;
+    void *quest = NULL;
+    const ChainDef *chain = g_quest_mode >= 2 ? &CHAINS[g_quest_mode - 2] : NULL;
+
+    if (chain == NULL) {
+        quest = inv(g_uiquesttracker_get_currentquest, NULL, NULL);
+        if (quest == NULL) {
+            snprintf(g_quest_status, sizeof(g_quest_status),
+                    "no quest tracked - track one in-game");
+            g_quest_last_id = 0;
+            return;
+        }
+        qid = g_quest_get_id != NULL ? inv_int(g_quest_get_id, quest, NULL) : 0;
+    } else {
+        if (g_chain_index >= chain->count) {
+            snprintf(g_quest_status, sizeof(g_quest_status), "%s complete!", chain->name);
+            g_quest_mode = 0;
+            return;
+        }
+        /* Get to the chain's map before anything else - sent once per chain
+           activation (toggling the mode again re-sends it), not every tick;
+           transferring to the map you're already on is at best a no-op and
+           at worst an unwanted reload, so this is deliberately not
+           re-checked continuously. */
+        if (!g_chain_tfer_sent && g_req_transfer_class != NULL && g_req_transfer_ctor != NULL &&
+            il2cpp_object_new && g_get_name != NULL && il2cpp_string_new) {
+            void *req = il2cpp_object_new(g_req_transfer_class);
+            if (req != NULL) {
+                void *player_name = inv(g_get_name, player, NULL);
+                void *ctor_args[5] = {player_name, il2cpp_string_new(chain->map),
+                                      il2cpp_string_new(""), il2cpp_string_new(chain->frame),
+                                      il2cpp_string_new(chain->pad)};
+                inv(g_req_transfer_ctor, req, ctor_args);
+                void *send_args[1] = {req};
+                inv(g_send_request, g_aec_instance, send_args);
+                LOGI("quest: chain '%s' - transferring to %s/%s/%s", chain->name, chain->map,
+                     chain->frame, chain->pad);
+            }
+            g_chain_tfer_sent = 1;
+        }
+
+        qid = chain->ids[g_chain_index];
+        void *id_args[1] = {&qid};
+        quest = g_quest_get != NULL ? inv(g_quest_get, NULL, id_args) : NULL;
+        if (quest == NULL) {
+            /* Not cached client-side yet - most likely still loading into
+               the chain's map, or the quest def just has not been sent.
+               getQuests populates Quest.Get() the same as opening the quest
+               log once would. */
+            if (now >= g_next_getquests_request && g_request_class != NULL &&
+                g_request_ctor != NULL && g_send_request != NULL && il2cpp_object_new &&
+                il2cpp_string_new) {
+                g_next_getquests_request = now + 5.0f;
+                void *req = il2cpp_object_new(g_request_class);
+                if (req != NULL) {
+                    void *ctor_args[1] = {il2cpp_string_new("getQuests")};
+                    inv(g_request_ctor, req, ctor_args);
+                    void *send_args[1] = {req};
+                    inv(g_send_request, g_aec_instance, send_args);
+                }
+                snprintf(g_quest_status, sizeof(g_quest_status),
+                        "%s - loading quest %d (%d/%d)", chain->name, qid, g_chain_index + 1,
+                        chain->count);
+            }
+            return;
+        }
     }
 
-    int32_t qid = g_quest_get_id != NULL ? inv_int(g_quest_get_id, quest, NULL) : 0;
     if (qid != g_quest_last_id) {
-        /* Tracker moved to a different quest - fresh attempt, whether that's
-           chain auto-advance or the player tracking a new one by hand. */
+        /* Target moved to a different quest - fresh attempt, whether that's
+           the tracker changing, a chain advancing, or the player tracking a
+           new one by hand while in track mode. */
         g_quest_last_id = qid;
         g_quest_accept_sent = 0;
         g_quest_turnin_sent = 0;
-        LOGI("quest: now tracking quest %d", qid);
+        LOGI("quest: now working on quest %d", qid);
     }
     void *id_args[1] = {&qid};
 
@@ -2089,12 +2197,27 @@ static void quest_tick(void)
             void *send_args[1] = {req};
             inv(g_send_request, g_aec_instance, send_args);
             g_quest_turnin_sent = 1;
-            snprintf(g_quest_status, sizeof(g_quest_status), "quest %d turned in - waiting for "
-                                                              "next tracked quest",
-                    qid);
             LOGI("quest: sent RequestTryQuestComplete(%d, -1)", qid);
-            /* Farm stays ON: whatever the tracker points to next (chain
-               auto-advance or a manual re-track) picks up on its own. */
+            if (chain != NULL) {
+                /* Chain mode advances off our own baked-in list, not the
+                   live tracker - deterministic regardless of whether the
+                   client happens to auto-track the next storyline quest. */
+                g_chain_index++;
+                if (g_chain_index >= chain->count) {
+                    snprintf(g_quest_status, sizeof(g_quest_status), "%s complete!",
+                            chain->name);
+                } else {
+                    snprintf(g_quest_status, sizeof(g_quest_status),
+                            "%s - quest %d turned in (%d/%d)", chain->name, qid,
+                            g_chain_index + 1, chain->count);
+                }
+            } else {
+                snprintf(g_quest_status, sizeof(g_quest_status),
+                        "quest %d turned in - waiting for next tracked quest", qid);
+                /* Track mode stays on this ID until the tracker itself
+                   moves; the id-change check above resets accept/turnin
+                   state whenever that happens. */
+            }
         }
     }
 }
@@ -2313,19 +2436,27 @@ static void hook_host_ongui(void *self, void *method)
         g_next_hunt = 0.0f;
     }
 
-    /* Quest farming: no ID entry - acts on whatever UIQuestTracker.CurrentQuest
-       already is. Track/accept a quest normally in-game, then just leave this
-       on; it follows the tracker through however much of a chain keeps
-       getting tracked. Forces Hunt on while a tracked quest isn't ready to
-       turn in yet - kill-count objectives only, see the quest farming
-       section's own comment for what this does not cover. */
-    if (gui_button(18, 316, 160, 30, g_quest_farm ? "Farm: ON" : "Farm: OFF")) {
-        g_quest_farm = !g_quest_farm;
-        if (g_quest_farm) {
-            g_quest_accept_sent = 0;
-            g_quest_turnin_sent = 0;
-            g_next_quest_tick = 0.0f;
-        }
+    /* Quest farming: one button cycles Off -> Track -> each named chain,
+       rather than growing a button per mode. Track acts on whatever
+       UIQuestTracker.CurrentQuest already is (track/accept normally
+       in-game, no ID entry); a chain mode transfers to its map and works a
+       baked-in quest list start to finish. Either way this forces Hunt on
+       for kill-count objectives and dispatches Interact/Apop objectives -
+       see the quest farming section's own comment for what it does not
+       cover (Cutscene, cross-cell travel to a machine/NPC). */
+    const char *mode_label = g_quest_mode == 0   ? "Quest: Off"
+                             : g_quest_mode == 1 ? "Quest: Track"
+                                                 : CHAINS[g_quest_mode - 2].name;
+    if (gui_button(18, 316, 160, 30, mode_label)) {
+        g_quest_mode = (g_quest_mode + 1) % (2 + CHAIN_COUNT);
+        g_quest_accept_sent = 0;
+        g_quest_turnin_sent = 0;
+        g_chain_index = 0;
+        g_chain_tfer_sent = 0;
+        g_next_quest_tick = 0.0f;
+        g_next_getquests_request = 0.0f;
+        g_quest_last_id = 0;
+        snprintf(g_quest_status, sizeof(g_quest_status), "%s", g_quest_mode == 0 ? "idle" : "starting");
     }
     snprintf(buf, sizeof(buf), "quest: %s", g_quest_status);
     gui_text(g_gui_label, 18, 352, 326, 24, buf);
@@ -2540,6 +2671,7 @@ static void setup_menu(void *domain,
         void *tracker_class = class_from_name(g_cs_image, "", "UIQuestTracker");
         void *player_class = class_from_name(g_cs_image, "", "Player");
         if (quest_class != NULL) {
+            g_quest_get = il2cpp_class_get_method_from_name(quest_class, "Get", 1);
             g_quest_get_id = il2cpp_class_get_method_from_name(quest_class, "get_ID", 0);
             g_quest_is_ready_turnin =
                 il2cpp_class_get_method_from_name(quest_class, "IsReadyForTurnin", 0);
@@ -2554,11 +2686,14 @@ static void setup_menu(void *domain,
         g_req_accept_ctor = find_method(g_req_accept_class, ".ctor", 1, 0, NULL);
         g_req_turnin_class = class_from_name(g_cs_image, "", "RequestTryQuestComplete");
         g_req_turnin_ctor = find_method(g_req_turnin_class, ".ctor", 2, 0, NULL);
-        LOGI("menu: quest CurrentQuest=%p get_ID=%p IsReadyForTurnin=%p IsQuestAccepted=%p "
-             "Accept=%p/%p TurnIn=%p/%p",
-             g_uiquesttracker_get_currentquest, g_quest_get_id, g_quest_is_ready_turnin,
-             g_player_is_quest_accepted, g_req_accept_class, g_req_accept_ctor,
-             g_req_turnin_class, g_req_turnin_ctor);
+        g_req_transfer_class = class_from_name(g_cs_image, "", "RequestMoveToArea");
+        g_req_transfer_ctor = find_method(g_req_transfer_class, ".ctor", 5, 0, NULL);
+        LOGI("menu: quest Get=%p CurrentQuest=%p get_ID=%p IsReadyForTurnin=%p "
+             "IsQuestAccepted=%p Accept=%p/%p TurnIn=%p/%p Transfer=%p/%p",
+             g_quest_get, g_uiquesttracker_get_currentquest, g_quest_get_id,
+             g_quest_is_ready_turnin, g_player_is_quest_accepted, g_req_accept_class,
+             g_req_accept_ctor, g_req_turnin_class, g_req_turnin_ctor, g_req_transfer_class,
+             g_req_transfer_ctor);
 
         /* Objective dispatch: Interact (machine click) and Apop/Talk (NPC
            click). See next_incomplete_objective()/find_machine_in_subtree()/
