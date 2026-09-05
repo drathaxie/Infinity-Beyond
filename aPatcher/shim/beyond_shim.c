@@ -26,6 +26,7 @@
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+#include <strings.h>
 #include <sys/mman.h>
 #include <unistd.h>
 
@@ -48,6 +49,7 @@ typedef void *(*il2cpp_runtime_invoke_t)(void *method, void *obj, void **params,
 typedef uint16_t *(*il2cpp_string_chars_t)(void *str);
 typedef int32_t (*il2cpp_string_length_t)(void *str);
 typedef void **(*il2cpp_domain_get_assemblies_t)(void *domain, size_t *size);
+typedef uint32_t (*il2cpp_array_length_t)(void *array);
 typedef size_t (*il2cpp_image_get_class_count_t)(void *image);
 typedef void *(*il2cpp_image_get_class_t)(void *image, size_t index);
 typedef void *(*il2cpp_class_get_methods_t)(void *klass, void **iter);
@@ -469,6 +471,56 @@ static void *hook_get_response(void *a0, void *a1)
 }
 
 /* -------------------------------------------------------------------------
+ * TEMPORARY: raw getQuests dump.
+ *
+ * The quest-chain IDs shipped so far were pulled from InfinityServer's OWN
+ * questdb - a different server with its own numbering - which is why
+ * players are getting kicked for an invalid quest ID against live AE. The
+ * only place live AE's real quest IDs/names/prevQuest links exist is the
+ * getQuests response itself, and there is no REST equivalent (confirmed:
+ * AE's catalog REST endpoints cover asset bundles/monsters/soundtracks, not
+ * quest defs - those are socket-only). log_packet only ever sees the
+ * ALREADY-DESERIALIZED Response object, so this hooks one level earlier,
+ * the same point the desktop sniffer's AECWrapAndQueueResponsePatch reads
+ * raw JSON from - AEC.WrapAndQueueResponse(byte[] data), before it becomes
+ * a typed object at all - and dumps anything that looks quest-related
+ * straight to logcat, chunked under logcat's per-line limit. Remove once
+ * real chain data replaces the placeholders this is meant to unblock. */
+static void *(*orig_wrap_and_queue)(void *self, void *data, void *method);
+static void *g_encoding_utf8_instance; /* System.Text.Encoding.UTF8 (static property value) */
+static void *g_encoding_getstring;     /* Encoding.GetString(byte[]) */
+
+static void *hook_wrap_and_queue(void *self, void *data, void *method)
+{
+    if (data != NULL && g_encoding_utf8_instance != NULL && g_encoding_getstring != NULL) {
+        void *args[1] = {data};
+        void *managed_str = inv(g_encoding_getstring, g_encoding_utf8_instance, args);
+        if (managed_str != NULL) {
+            static char buf[16384];
+            mstr_to_utf8(managed_str, buf, sizeof(buf));
+            size_t total_len = strlen(buf);
+            /* First pass: filter unknown - log a short prefix of EVERYTHING so
+               the real field names/Cmd string are visible, then narrow. Loose
+               on purpose (quest/Quest/prevQuest/storyline all match) since we
+               do not yet know which one the wire actually uses. */
+            bool looks_relevant = strstr(buf, "uest") != NULL || strstr(buf, "toryline") != NULL;
+            LOGI("QDIAG len=%zu relevant=%d prefix=%.160s", total_len, looks_relevant, buf);
+            if (looks_relevant) {
+                size_t len = total_len;
+                for (size_t off = 0; off < len; off += 900) {
+                    char chunk[920];
+                    size_t n = len - off < 900 ? len - off : 900;
+                    memcpy(chunk, buf + off, n);
+                    chunk[n] = '\0';
+                    LOGI("QUESTDUMP[%zu/%zu]: %s", off, len, chunk);
+                }
+            }
+        }
+    }
+    return orig_wrap_and_queue(self, data, method);
+}
+
+/* -------------------------------------------------------------------------
  * Outgoing packets: AEC.sendRequest(Request)
  *
  * Instance method, so the native shape is (this, request, MethodInfo*). Gives
@@ -821,12 +873,16 @@ static const ChainDef CHAINS[] = {
 #define CHAIN_COUNT ((int)(sizeof(CHAINS) / sizeof(CHAINS[0])))
 
 /* Quest-farm state, read/written by quest_tick() further down.
-   g_quest_mode: 0 = off, 1 = follow whatever UIQuestTracker.CurrentQuest
-   already is (no ID entry - track/accept normally in-game), 2..(1+N) = the
-   Nth entry of CHAINS, run start to finish off the baked-in ID list rather
-   than the live tracker. One button cycles through all of these - see the
-   menu draw code - rather than growing a button per chain. */
-static int g_quest_mode;
+   g_quest_selected: 0 = follow whatever UIQuestTracker.CurrentQuest already
+   is (no ID entry - track/accept normally in-game), 1..N = the Nth entry of
+   CHAINS, run start to finish off the baked-in ID list rather than the live
+   tracker. Selecting is separate from running (g_quest_running) - a select
+   panel to change the choice, plus one Start/Stop button, instead of either
+   a button per chain or one button doing double duty as both selector and
+   on/off switch. */
+static int g_quest_selected;
+static int g_quest_running;
+static int g_quest_select_open;
 static int g_chain_index;
 static int g_chain_tfer_sent;
 static float g_next_quest_tick;
@@ -1797,6 +1853,10 @@ static void *g_req_turnin_class;
 static void *g_req_turnin_ctor;                 /* RequestTryQuestComplete(int,int)        */
 static void *g_req_transfer_class;
 static void *g_req_transfer_ctor;               /* RequestMoveToArea(string,string,string,string,string) */
+static void *g_area_get_mapname;                /* Area.get_mapName() - confirms chain-mode arrival
+                                                    before accepting; see quest_tick's chain branch */
+static float g_chain_tfer_sent_at;
+static float g_chain_arrived_at;                /* 0 = not yet confirmed arrived */
 static int g_quest_last_id;                     /* detects the target moving to a new quest */
 static float g_next_getquests_request;          /* chain mode: retry cadence while Quest.Get(id) is null */
 
@@ -2016,7 +2076,7 @@ static void *current_cell_transform(void *player)
 
 static void quest_tick(void)
 {
-    if (g_quest_mode == 0) {
+    if (!g_quest_running) {
         return;
     }
     float now = inv_float(g_time_get_time, NULL, NULL);
@@ -2030,13 +2090,13 @@ static void quest_tick(void)
         return;
     }
 
-    /* Target resolution: mode 1 reads whatever is live-tracked in-game;
-       chain mode (2+) reads a fixed ID off the baked-in CHAINS table. Once
+    /* Target resolution: Track reads whatever is live-tracked in-game; a
+       selected chain reads a fixed ID off the baked-in CHAINS table. Once
        target_id/quest are set, everything below (accept/dispatch/turn-in)
        is identical for both. */
     int32_t qid = 0;
     void *quest = NULL;
-    const ChainDef *chain = g_quest_mode >= 2 ? &CHAINS[g_quest_mode - 2] : NULL;
+    const ChainDef *chain = g_quest_selected >= 1 ? &CHAINS[g_quest_selected - 1] : NULL;
 
     if (chain == NULL) {
         quest = inv(g_uiquesttracker_get_currentquest, NULL, NULL);
@@ -2050,29 +2110,66 @@ static void quest_tick(void)
     } else {
         if (g_chain_index >= chain->count) {
             snprintf(g_quest_status, sizeof(g_quest_status), "%s complete!", chain->name);
-            g_quest_mode = 0;
+            g_quest_running = 0;
             return;
         }
-        /* Get to the chain's map before anything else - sent once per chain
-           activation (toggling the mode again re-sends it), not every tick;
-           transferring to the map you're already on is at best a no-op and
-           at worst an unwanted reload, so this is deliberately not
-           re-checked continuously. */
-        if (!g_chain_tfer_sent && g_req_transfer_class != NULL && g_req_transfer_ctor != NULL &&
-            il2cpp_object_new && g_get_name != NULL && il2cpp_string_new) {
-            void *req = il2cpp_object_new(g_req_transfer_class);
-            if (req != NULL) {
-                void *player_name = inv(g_get_name, player, NULL);
-                void *ctor_args[5] = {player_name, il2cpp_string_new(chain->map),
-                                      il2cpp_string_new(""), il2cpp_string_new(chain->frame),
-                                      il2cpp_string_new(chain->pad)};
-                inv(g_req_transfer_ctor, req, ctor_args);
-                void *send_args[1] = {req};
-                inv(g_send_request, g_aec_instance, send_args);
-                LOGI("quest: chain '%s' - transferring to %s/%s/%s", chain->name, chain->map,
-                     chain->frame, chain->pad);
+
+        /* Get to the chain's map before doing anything else - and, critically,
+           WAIT for confirmed arrival before accepting. The first version sent
+           the accept request in the same tick as the transfer (or the very
+           next one) with no confirmation the character had actually landed;
+           live AE's servers are far stricter than our own about validating
+           that the client's real server-side location matches what a request
+           claims, and an accept for a location-gated quest while still
+           mid-transfer reads exactly like invalid/bot behavior - which is
+           what was getting players kicked, not a wrong quest ID (the whole
+           baked-in ID/prevQuest sequence for all four chains was cross-checked
+           against real live-AE packet captures and matches exactly). */
+        char current_map[40] = "";
+        void *area_for_map = NULL;
+        if (g_area_currentarea_field != NULL && il2cpp_field_static_get_value) {
+            il2cpp_field_static_get_value(g_area_currentarea_field, &area_for_map);
+        }
+        if (area_for_map != NULL && g_area_get_mapname != NULL) {
+            mstr_to_utf8(inv(g_area_get_mapname, area_for_map, NULL), current_map,
+                        sizeof(current_map));
+        }
+        bool arrived = current_map[0] != '\0' && strcasecmp(current_map, chain->map) == 0;
+
+        if (!arrived) {
+            g_chain_arrived_at = 0.0f;
+            bool need_send = !g_chain_tfer_sent || (now - g_chain_tfer_sent_at > 10.0f);
+            if (need_send && g_req_transfer_class != NULL && g_req_transfer_ctor != NULL &&
+                il2cpp_object_new && g_get_name != NULL && il2cpp_string_new) {
+                void *req = il2cpp_object_new(g_req_transfer_class);
+                if (req != NULL) {
+                    void *player_name = inv(g_get_name, player, NULL);
+                    void *ctor_args[5] = {player_name, il2cpp_string_new(chain->map),
+                                          il2cpp_string_new(""), il2cpp_string_new(chain->frame),
+                                          il2cpp_string_new(chain->pad)};
+                    inv(g_req_transfer_ctor, req, ctor_args);
+                    void *send_args[1] = {req};
+                    inv(g_send_request, g_aec_instance, send_args);
+                    LOGI("quest: chain '%s' - transferring to %s/%s/%s", chain->name, chain->map,
+                         chain->frame, chain->pad);
+                }
+                g_chain_tfer_sent = 1;
+                g_chain_tfer_sent_at = now;
             }
-            g_chain_tfer_sent = 1;
+            snprintf(g_quest_status, sizeof(g_quest_status), "%s - traveling to %s (at %s)",
+                    chain->name, chain->map, current_map[0] ? current_map : "?");
+            return;
+        }
+        if (g_chain_arrived_at <= 0.0f) {
+            g_chain_arrived_at = now;
+        }
+        if (now - g_chain_arrived_at < 1.5f) {
+            /* Same settle window the death/respawn handling uses - a map
+               transfer that just landed can still report stale area/position
+               state for a frame or two. */
+            snprintf(g_quest_status, sizeof(g_quest_status), "%s - arrived, settling",
+                    chain->name);
+            return;
         }
 
         qid = chain->ids[g_chain_index];
@@ -2399,11 +2496,13 @@ static void hook_host_ongui(void *self, void *method)
     if (gui_button(198, 140, 84, 30, g_help_open ? "Help X" : "Help")) {
         g_help_open = !g_help_open;
         g_log_open = 0; /* one side window at a time - they share the same slot */
+        g_quest_select_open = 0;
     }
 
     if (gui_button(18, 176, 84, 30, g_log_open ? "Log X" : "Log")) {
         g_log_open = !g_log_open;
         g_help_open = 0;
+        g_quest_select_open = 0;
     }
     if (gui_button(108, 176, 160, 30,
                    g_autoskills ? "Autoskills: ON" : "Autoskills: OFF")) {
@@ -2436,27 +2535,38 @@ static void hook_host_ongui(void *self, void *method)
         g_next_hunt = 0.0f;
     }
 
-    /* Quest farming: one button cycles Off -> Track -> each named chain,
-       rather than growing a button per mode. Track acts on whatever
-       UIQuestTracker.CurrentQuest already is (track/accept normally
-       in-game, no ID entry); a chain mode transfers to its map and works a
-       baked-in quest list start to finish. Either way this forces Hunt on
-       for kill-count objectives and dispatches Interact/Apop objectives -
-       see the quest farming section's own comment for what it does not
-       cover (Cutscene, cross-cell travel to a machine/NPC). */
-    const char *mode_label = g_quest_mode == 0   ? "Quest: Off"
-                             : g_quest_mode == 1 ? "Quest: Track"
-                                                 : CHAINS[g_quest_mode - 2].name;
-    if (gui_button(18, 316, 160, 30, mode_label)) {
-        g_quest_mode = (g_quest_mode + 1) % (2 + CHAIN_COUNT);
+    /* Quest farming: a select panel (same "one side window" slot as Log/Help)
+       picks WHAT to work on, a separate Start/Stop switches whether it is
+       currently running - changing your pick no longer requires stopping
+       first, and starting doesn't require re-picking. Track acts on
+       whatever UIQuestTracker.CurrentQuest already is (track/accept
+       normally in-game, no ID entry); a chain transfers to its map -
+       waiting for confirmed arrival before accepting anything, see
+       quest_tick's own comment on why that wait matters on live AE - and
+       works a baked-in quest list start to finish. Either way this forces
+       Hunt on for kill-count objectives and dispatches Interact/Apop
+       objectives - see the quest farming section's own comment for what it
+       does not cover (Cutscene, cross-cell travel to a machine/NPC). */
+    const char *selected_label =
+        g_quest_selected == 0 ? "Track Current" : CHAINS[g_quest_selected - 1].name;
+    snprintf(buf, sizeof(buf), "Quest: %s", selected_label);
+    if (gui_button(18, 316, 160, 30, buf)) {
+        g_quest_select_open = !g_quest_select_open;
+        g_log_open = 0;
+        g_help_open = 0;
+    }
+    if (gui_button(184, 316, 90, 30, g_quest_running ? "Stop" : "Start")) {
+        g_quest_running = !g_quest_running;
         g_quest_accept_sent = 0;
         g_quest_turnin_sent = 0;
         g_chain_index = 0;
         g_chain_tfer_sent = 0;
+        g_chain_arrived_at = 0.0f;
         g_next_quest_tick = 0.0f;
         g_next_getquests_request = 0.0f;
         g_quest_last_id = 0;
-        snprintf(g_quest_status, sizeof(g_quest_status), "%s", g_quest_mode == 0 ? "idle" : "starting");
+        snprintf(g_quest_status, sizeof(g_quest_status), "%s",
+                g_quest_running ? "starting" : "stopped");
     }
     snprintf(buf, sizeof(buf), "quest: %s", g_quest_status);
     gui_text(g_gui_label, 18, 352, 326, 24, buf);
@@ -2493,6 +2603,27 @@ static void hook_host_ongui(void *self, void *method)
         }
         if (gui_button(534, 348, 86, 30, "Close")) {
             g_help_open = 0;
+        }
+    }
+
+    if (g_quest_select_open) {
+        gui_text(g_gui_box, 360, 44, 340, 356, "Tap what to work on");
+        if (gui_button(370, 78, 240, 30,
+                       g_quest_selected == 0 ? "> Track Current" : "Track Current")) {
+            g_quest_selected = 0;
+            g_quest_select_open = 0;
+        }
+        for (int i = 0; i < CHAIN_COUNT; i++) {
+            char label[48];
+            snprintf(label, sizeof(label), "%s%s", g_quest_selected == i + 1 ? "> " : "",
+                    CHAINS[i].name);
+            if (gui_button(370, 112.0f + (float)i * 34.0f, 240, 30, label)) {
+                g_quest_selected = i + 1;
+                g_quest_select_open = 0;
+            }
+        }
+        if (gui_button(370, 348, 96, 30, "Close")) {
+            g_quest_select_open = 0;
         }
     }
 
@@ -2726,8 +2857,11 @@ static void setup_menu(void *domain,
             g_pqd_is_objective_complete =
                 il2cpp_class_get_method_from_name(pqd_class, "IsObjectiveComplete", 1);
         }
-        if (area_c != NULL && il2cpp_class_get_field_from_name) {
-            g_area_cells_field = il2cpp_class_get_field_from_name(area_c, "Cells");
+        if (area_c != NULL) {
+            if (il2cpp_class_get_field_from_name) {
+                g_area_cells_field = il2cpp_class_get_field_from_name(area_c, "Cells");
+            }
+            g_area_get_mapname = il2cpp_class_get_method_from_name(area_c, "get_mapName", 0);
         }
         if (entity_c != NULL && il2cpp_class_get_field_from_name) {
             g_entity_frame_field = il2cpp_class_get_field_from_name(entity_c, "Frame");
@@ -2761,10 +2895,11 @@ static void setup_menu(void *domain,
              g_qti_refscontains_method, g_player_quests_field, g_pqd_is_objective_complete,
              g_area_cells_field, g_entity_frame_field, g_entity_apopid_field);
         LOGI("menu: objectives Component.transform=%p childCount=%p GetChild=%p "
-             "tf.gameObject=%p Object.name=%p MapMachine=%p/%p NPCButton=%p/%p",
+             "tf.gameObject=%p Object.name=%p MapMachine=%p/%p NPCButton=%p/%p mapName=%p",
              g_component_get_transform, g_transform_get_childcount, g_transform_get_child,
              g_transform_get_gameobject, g_object_get_name, g_mapmachine_type_obj,
-             g_mapmachine_interact, g_npcbutton_type_obj, g_npcbutton_interact);
+             g_mapmachine_interact, g_npcbutton_type_obj, g_npcbutton_interact,
+             g_area_get_mapname);
     }
 
     /* Autoskills: UISkillSlots.GetSlot(int) + SkillSlotButton.UseSkill(bool),
@@ -3246,6 +3381,27 @@ static void *beyond_thread(void *arg)
     if (hook_func("AEC.GetResponse", code, (void *)hook_get_response,
                   (void **)&orig_get_response)) {
         LOGI("hooked AEC.GetResponse - logging packets");
+    }
+
+    /* TEMPORARY diagnostic - see hook_wrap_and_queue's own comment. */
+    void *wrap_method = il2cpp_class_get_method_from_name(aec, "WrapAndQueueResponse", 1);
+    void *wrap_code = wrap_method ? method_code_ptr(wrap_method) : NULL;
+    if (wrap_code != NULL &&
+        hook_func("AEC.WrapAndQueueResponse", wrap_code, (void *)hook_wrap_and_queue,
+                  (void **)&orig_wrap_and_queue)) {
+        void *mscorlib = assembly_open(domain, "mscorlib");
+        void *encoding_class = mscorlib
+                                   ? class_from_name(assembly_image(mscorlib), "System.Text",
+                                                     "Encoding")
+                                   : NULL;
+        if (encoding_class != NULL) {
+            void *get_utf8 = il2cpp_class_get_method_from_name(encoding_class, "get_UTF8", 0);
+            g_encoding_utf8_instance = get_utf8 ? inv(get_utf8, NULL, NULL) : NULL;
+            g_encoding_getstring =
+                il2cpp_class_get_method_from_name(encoding_class, "GetString", 1);
+        }
+        LOGI("quest dump: mscorlib=%p Encoding=%p UTF8=%p GetString=%p", mscorlib,
+             encoding_class, g_encoding_utf8_instance, g_encoding_getstring);
     }
 
     /* Probes run after the hook so a probe failure cannot cost us packet
