@@ -17,6 +17,7 @@
  */
 
 #include <android/log.h>
+#include <ctype.h>
 #include <dlfcn.h>
 #include <jni.h>
 #include <math.h>
@@ -87,6 +88,7 @@ static il2cpp_type_get_name_t il2cpp_type_get_name;
 static il2cpp_free_t il2cpp_free;
 
 typedef void *(*il2cpp_object_unbox_t)(void *obj);
+typedef bool (*il2cpp_class_is_valuetype_t)(void *klass);
 typedef void *(*il2cpp_gchandle_new_t)(void *obj, bool pinned);
 typedef void *(*il2cpp_gchandle_get_target_t)(void *handle);
 typedef void (*il2cpp_gchandle_free_t)(void *handle);
@@ -95,6 +97,7 @@ typedef void (*il2cpp_field_get_value_t)(void *obj, void *field, void *out);
 typedef void (*il2cpp_field_static_get_value_t)(void *field, void *out);
 
 static il2cpp_object_unbox_t il2cpp_object_unbox;
+static il2cpp_class_is_valuetype_t il2cpp_class_is_valuetype;
 static il2cpp_gchandle_new_t il2cpp_gchandle_new;
 static il2cpp_gchandle_get_target_t il2cpp_gchandle_get_target;
 static il2cpp_gchandle_free_t il2cpp_gchandle_free;
@@ -399,6 +402,29 @@ static void *wait_for_library(void)
  * static - which the desktop Harmony patch does not tell us either.
  * ---------------------------------------------------------------------- */
 static void *(*orig_get_response)(void *a0, void *a1);
+static void *g_time_get_time;   /* moved up from its original spot near the skill globals -
+                                    log_packet below needs it and runs long before that point */
+
+/* Quest-progress signals lifted straight off the wire, mirroring what the
+   desktop's RuntimeEvents (a Harmony patch on ResponseQuestComplete.Execute)
+   captures - reading the SAME already-populated fields directly off the
+   response object GetResponse hands back is simpler here since this hook
+   already intercepts every response, no separate patch needed.
+   - QComp (ResponseQuestComplete): ID + Success confirm a turn-in actually
+     landed, instead of advancing the chain the instant we SEND the request -
+     a dropped/rejected send used to silently desync chain progress from the
+     server's actual state.
+   - rNotify (ResponseNotify): "Spam Detected" means back off and retry, not
+     failure; anything else after a turn-in is a real rejection.
+   - mKill: any kill counts as forward progress for the hunt-stall check,
+     independent of which quest/objective it happened to credit. */
+static void *g_qcomp_id_field, *g_qcomp_success_field;
+static void *g_notify_msg_field;
+static int32_t g_qcomp_qid = -1;
+static float g_qcomp_at = -1.0f;
+static char g_notify_msg[128];
+static float g_notify_at = -1.0f;
+static float g_quest_last_activity_at;
 
 /* Packet log shown in the menu. Written from the GetResponse/sendRequest hooks
    and read in OnGUI - all three run on Unity's main thread, so no lock. */
@@ -451,6 +477,39 @@ static void log_packet(void *response, int blocked)
     snprintf(line, sizeof(line), "%s%s", blocked ? "x " : "< ", cmd[0] ? cmd : "?");
     pkt_push(line);
     LOGI("packet %s%s (%s)", blocked ? "[BLOCKED] " : "", type_name ? type_name : "?", cmd);
+
+    float now_ts = g_time_get_time ? inv_float(g_time_get_time, NULL, NULL) : 0.0f;
+    if (strcmp(cmd, "QComp") == 0) {
+        if (g_qcomp_id_field == NULL) {
+            g_qcomp_id_field = il2cpp_class_get_field_from_name(klass, "ID");
+            g_qcomp_success_field = il2cpp_class_get_field_from_name(klass, "Success");
+        }
+        int32_t id = -1;
+        uint8_t ok = 0;
+        if (g_qcomp_id_field != NULL) {
+            il2cpp_field_get_value(response, g_qcomp_id_field, &id);
+        }
+        if (g_qcomp_success_field != NULL) {
+            il2cpp_field_get_value(response, g_qcomp_success_field, &ok);
+        }
+        if (ok) {
+            g_qcomp_qid = id;
+            g_qcomp_at = now_ts;
+            g_quest_last_activity_at = now_ts;
+        }
+    } else if (strcmp(cmd, "rNotify") == 0) {
+        if (g_notify_msg_field == NULL) {
+            g_notify_msg_field = il2cpp_class_get_field_from_name(klass, "msg");
+        }
+        void *msg_str = NULL;
+        if (g_notify_msg_field != NULL) {
+            il2cpp_field_get_value(response, g_notify_msg_field, &msg_str);
+        }
+        mstr_to_utf8(msg_str, g_notify_msg, sizeof(g_notify_msg));
+        g_notify_at = now_ts;
+    } else if (strcmp(cmd, "mKill") == 0) {
+        g_quest_last_activity_at = now_ts;
+    }
 }
 
 static void *hook_get_response(void *a0, void *a1)
@@ -837,6 +896,8 @@ static int g_chain_tfer_sent;
 static float g_next_quest_tick;
 static int g_quest_accept_sent;
 static int g_quest_turnin_sent;
+static float g_quest_turnin_sent_at;  /* gates chain-advance on confirmed QComp, not just send -
+                                          see the QComp/rNotify tracking near hook_get_response */
 static char g_quest_status[80] = "idle";
 
 static float g_scale = 2.0f;
@@ -849,8 +910,11 @@ static int g_help_page;
 static void *g_skillslots; /* live UISkillSlots, captured from its Register hook */
 static void *g_get_slot;
 static void *g_use_skill;
-static void *g_time_get_time;
 static int g_autoskills;
+static int g_autoskip_cutscenes; /* default off, matching BeyondAgentClass.autoSkipCutscenes */
+static void *g_dialogger_endpressed;
+static void *g_pending_cutscene_mgr; /* one-shot: set by the hook, consumed by cutscene_skip_tick */
+static void *(*orig_start_cutscene)(void *self, void *method);
 static int g_skill_slot;
 static float g_next_skill;
 
@@ -936,6 +1000,17 @@ static void *g_entity_get_target;       /* Entity.get_target()             (0-ar
 static void *g_go_get_transform;        /* GameObject.get_transform()      (0-arg) */
 static void *g_go_getcomponent;         /* GameObject.GetComponent(Type)   (1-arg) */
 static void *g_transform_get_localpos;  /* Transform.get_localPosition()   (0-arg) */
+static void *g_component_get_transform; /* Component.get_transform() - MapCell is a Component,
+                                           not a GameObject, so this is a separate resolution
+                                           from GameObject.get_transform. Moved up from its
+                                           original spot - component_local_in_player_frame needs
+                                           it and runs long before that point. */
+static void *g_transform_get_position;   /* Transform.get_position() - WORLD position, unlike
+                                             get_localPosition (relative to the object's own
+                                             immediate parent). Also moved up from its original
+                                             spot near TransformPoint, for the same reason. */
+static void *g_transform_inversetransformpoint; /* Transform.InverseTransformPoint(Vector3) -
+                                             world->local, the other direction from TransformPoint */
 static void *g_targetable_class;
 static void *g_targetable_type_obj;     /* cached Type object for GetComponent(Type) */
 static void *g_targetable_clickme;
@@ -947,6 +1022,36 @@ static int g_hunt;
 static float g_next_hunt;
 static float g_hunt_settle_until;       /* pause hunting until this Time.time, post-revive */
 static float g_max_engage_dist = 9.0f;  /* matches QuestRunner.MaxEngageDist */
+#define QUEST_HUNT_TIMEOUT_SEC 90.0f     /* matches QuestRunner.HuntTimeoutNoProgress */
+#define INTERACT_REACH_DIST 2.5f         /* matches QuestRunner.InteractReachDist. Widening this
+                                             to 6.0 as a first guess did not fix "just approaching
+                                             forever" - the real cause was the missing give-up
+                                             fallback in approach_target, not this threshold. */
+/* The objective hunting is currently serving, published by quest_tick (which
+   runs at 1Hz) for hunt_tick (which runs at ~3Hz) so target selection can
+   filter on what the quest actually asks for instead of grabbing whatever is
+   nearest. Holding a raw managed pointer between ticks is safe here on two
+   counts: il2cpp's Boehm GC is non-moving, and the item stays reachable the
+   whole time via Quest.Turnins on the cached quest, so it cannot be
+   collected out from under us. Cleared whenever hunting is not objective-
+   driven, which reverts targeting to "any hostile". */
+static void *g_hunt_obj;
+static int32_t g_hunt_qotype = -1;
+static int32_t g_hunt_qid = -1;   /* current quest id, for the QUEST_MON_HINTS lookup */
+static void *g_req_movecell_class;
+static void *g_req_movecell_ctor;  /* RequestMoveToCell(string Frame, string Pad) - resolved
+                                       alongside the other Request subclasses in setup_menu */
+static char g_hunt_nav_frame[40];  /* frame a moveToCell was last sent for, and when -
+                                       mirrors QuestRunner.GoToFrame's resend throttle */
+static float g_hunt_nav_sent_at;
+/* Interact/Apop approach handoff: quest_tick (1Hz) publishes WHERE to walk,
+   hunt_tick (~3Hz) actually walks there and reports back whether it is time
+   to click. See hunt_tick's top and approach_target. */
+static int g_interact_approach_active;
+static float g_interact_approach_target[3];
+static float g_interact_reach_dist_pub;
+static int g_interact_ready;
+static float g_next_interact_approach;
 
 /* Shared with the nameplate spoof further down, which also needs the local
    player - resolved once in setup_menu. */
@@ -972,6 +1077,69 @@ static bool read_local_pos(void *entity, float out[3])
     out[1] = raw[1];
     out[2] = raw[2];
     return true;
+}
+
+/* A Transform's WORLD position, converted into `player_parent`'s local
+   space via InverseTransformPoint - exactly TickInteract/TickApop's
+   `me.transform.parent.InverseTransformPoint(target.transform.position)`.
+
+   The first cut of this (read_component_local_pos, since removed) used the
+   target's own localPosition directly, on the assumption that a machine or
+   NPC shares the player's parent the same way a hostile Monster does during
+   combat - true for monsters (they spawn as flat siblings in the cell), but
+   NOT for level-design machines, which can sit under arbitrary nested
+   sub-groups in the prefab hierarchy. localPosition is relative to a
+   transform's OWN immediate parent, not the player's - comparing it
+   directly against the player's local position was comparing two different
+   coordinate spaces. On device this meant the bot walked toward a point
+   offset from the real machine and never converged - reported as "running
+   at the armor pieces rather than clicking them." Going through world space
+   first sidesteps the mismatch regardless of nesting depth. Falls back to
+   the raw world position when there is no parent (matches PC's `?? world`
+   fallback for a rare parentless player). */
+static bool transform_local_in_player_frame(void *tr, void *player_parent, float out[3])
+{
+    if (tr == NULL || g_transform_get_position == NULL || !il2cpp_object_unbox) {
+        return false;
+    }
+    void *boxed_world = inv(g_transform_get_position, tr, NULL);
+    float *world = boxed_world ? (float *)il2cpp_object_unbox(boxed_world) : NULL;
+    if (world == NULL) {
+        return false;
+    }
+    if (player_parent != NULL && g_transform_inversetransformpoint != NULL) {
+        void *args[1] = {world};
+        void *boxed_local = inv(g_transform_inversetransformpoint, player_parent, args);
+        float *local = boxed_local ? (float *)il2cpp_object_unbox(boxed_local) : NULL;
+        if (local != NULL) {
+            out[0] = local[0];
+            out[1] = local[1];
+            out[2] = local[2];
+            return true;
+        }
+    }
+    out[0] = world[0];
+    out[1] = world[1];
+    out[2] = world[2];
+    return true;
+}
+
+/* Component (MapMachine, NPCButton) variant - goes through
+   Component.get_transform rather than Entity.getGameObject(). */
+static bool component_local_in_player_frame(void *component, void *player_parent, float out[3])
+{
+    void *tr = component && g_component_get_transform
+                  ? inv(g_component_get_transform, component, NULL)
+                  : NULL;
+    return transform_local_in_player_frame(tr, player_parent, out);
+}
+
+/* Entity (Monster/NPC) variant. */
+static bool entity_local_in_player_frame(void *entity, void *player_parent, float out[3])
+{
+    void *go = entity && g_entity_getgameobject ? inv(g_entity_getgameobject, entity, NULL) : NULL;
+    void *tr = go && g_go_get_transform ? inv(g_go_get_transform, go, NULL) : NULL;
+    return transform_local_in_player_frame(tr, player_parent, out);
 }
 
 /* -------------------------------------------------------------------------
@@ -1413,6 +1581,18 @@ static void *g_area_monsters_field;
 static void *g_monster_reaction_field;
 static void *g_entity_get_name;           /* resolved on Monster - see probe_monsters */
 static void *g_entity_get_currentstate;   /* resolved on Entity - Monster doesn't override it */
+/* Entity.get_ID - Monster's ctor assigns it from monBranch.MonID, which is
+   what a Killcount objective's RefArray entries hold. Only Player overrides
+   ID, so resolving on Entity is correct for monsters (unlike get_Name). */
+static void *g_entity_get_id;
+/* Declared here rather than with the rest of the quest bindings further down
+   because target filtering (matches_objective) needs it, and that runs above
+   them. */
+static void *g_qti_getrefint_method;   /* QuestTurninItem.GetRefInt(int) - avoids ever
+                                          touching RefArray's own array storage directly */
+static void *g_entity_frame_field;     /* Entity.Frame (string) - moved up from the quest
+                                          bindings block below; find_nearest_hostile's cell
+                                          filter needs it and runs before that block. */
 
 /* GameObject.GetComponent(Type) - the same non-generic overload setup_menu
    already uses for AddComponent(Type), since the generic GetComponent<T>()
@@ -1430,7 +1610,345 @@ static void *get_component(void *go, void *type_obj)
    player. Reuses the same field/method handles probe_monsters resolved -
    this is the same generic-dictionary walk, just picking a winner instead of
    just counting. Returns NULL if nothing hostile is loaded. */
-static void *find_nearest_hostile(void *player, const float me[3])
+/* The correct `this` pointer for invoking an instance method on whatever a
+   managed call just handed back.
+
+   il2cpp_runtime_invoke wants the UNBOXED payload for a value type but the
+   object pointer itself for a reference type, and getting this backwards is
+   silent: unboxing a reference type just returns a pointer past the object
+   header, so the callee reads its fields at the wrong offsets and behaves
+   like a garbage-but-valid instance rather than crashing.
+
+   That is exactly what broke objective dispatch. Dictionary<K,V>.Enumerator
+   is a STRUCT, so the Monsters walk unboxing it was right - and that made
+   "unbox the enumerator" look like the house rule. But System.Array's
+   GetEnumerator returns IEnumerator, whose concrete type (SZArrayEnumerator)
+   is a CLASS. Unboxing it handed MoveNext a bogus self, MoveNext read a
+   nonsense index/length and returned false on the first call, so the loop
+   body never ran once and next_incomplete_objective returned NULL for every
+   quest - reported as "no actionable objective visible, hunting" with no
+   error anywhere. Deciding per-object off is_valuetype is right for both. */
+static void *self_ptr(void *obj)
+{
+    if (obj == NULL || !il2cpp_object_get_class) {
+        return NULL;
+    }
+    void *klass = il2cpp_object_get_class(obj);
+    if (klass != NULL && il2cpp_class_is_valuetype && il2cpp_class_is_valuetype(klass)) {
+        return il2cpp_object_unbox ? il2cpp_object_unbox(obj) : NULL;
+    }
+    return obj;
+}
+
+/* Drives a foreach over any managed collection. `get_enumerator` must be
+   resolved on the class that actually DECLARES it (a generic collection
+   declares its own; an array inherits System.Array's), since
+   il2cpp_class_get_method_from_name never searches base classes. MoveNext /
+   get_Current then come off the returned enumerator's own concrete class. */
+typedef struct {
+    void *self;
+    void *move_next;
+    void *get_current;
+} EnumWalk;
+
+static bool enum_open(void *collection, void *get_enumerator, EnumWalk *w)
+{
+    w->self = NULL;
+    w->move_next = NULL;
+    w->get_current = NULL;
+    if (collection == NULL || get_enumerator == NULL) {
+        return false;
+    }
+    void *e = inv(get_enumerator, collection, NULL);
+    if (e == NULL) {
+        return false;
+    }
+    void *enum_class = il2cpp_object_get_class(e);
+    if (enum_class == NULL) {
+        return false;
+    }
+    w->self = self_ptr(e);
+    w->move_next = il2cpp_class_get_method_from_name(enum_class, "MoveNext", 0);
+    w->get_current = il2cpp_class_get_method_from_name(enum_class, "get_Current", 0);
+    return w->self != NULL && w->move_next != NULL && w->get_current != NULL;
+}
+
+/* Per-quest monster-ID hints, baked in from InfinityServer's own questdb
+   (server/questdb.py, itself synced from live AE captures - see
+   scripts/export_beyond_chains.py, which generates the equivalent hint data
+   the desktop Beyond consumes through a hand-authored chains.json).
+
+   This exists because QuestTurninItem.RefArray - the ONLY per-objective
+   target signal matches_objective() originally had - is empty on live AE for
+   these quests. Confirmed by pulling every Lair/Bludrut/Zard/Forest quest out
+   of the same questdb: e.g. quest 20 "The Wyverns" has refIds:[] but
+   objectives[].monsters:[17]. With RefArray empty, the old signal-less logic
+   fell through to "any hostile is fair game" for every Killcount objective -
+   exactly the "keeps killing water draconians regardless of the active
+   quest" behavior reported after the dispatch fix landed, since dispatch
+   working correctly just meant it now REACHED the targeting code instead of
+   never getting there. */
+typedef struct {
+    int32_t qid;
+    const int32_t *mons;
+    int count;
+} QuestMonHint;
+
+/* Covers every quest in server/db.py's questdb (180 quests, not just the 4
+   named chains) that has at least one Killcount objective with a resolved
+   monster - 78 of them. Same generation approach as the original 4-chain
+   table (union of objectives[].monsters per quest, via
+   scripts/export_beyond_chains.py's underlying questdb.build()), extended
+   to hand-verified overrides for objectives the harvester never resolved a
+   monster for at all (via:"none") - found by name-matching each one against
+   server/db.py's monsters table and individually confirmed (some auto
+   fuzzy-matches were wrong, e.g. "Cursed Cardboard Box" spuriously matching
+   a monster named "Card" - nothing here was accepted without checking).
+   Genuinely generic zone-wide objectives (e.g. "Undead Defeated" x50) were
+   deliberately left out: any hostile IS the correct match for those, not a
+   gap. This is what makes Track Current mode (not just the 4 baked chains)
+   correctly target the right monster for whatever quest is tracked. */
+static const int32_t MONS_Q1[] = {1, 7, 8};
+static const int32_t MONS_Q11[] = {126};
+static const int32_t MONS_Q14[] = {17};
+static const int32_t MONS_Q19[] = {206};
+static const int32_t MONS_Q23[] = {1};
+static const int32_t MONS_Q40[] = {14, 15, 204, 205};
+static const int32_t MONS_Q41[] = {12, 202};
+static const int32_t MONS_Q42[] = {11, 12, 13, 14, 15, 16, 199, 201, 202, 203, 204, 205, 206};
+static const int32_t MONS_Q43[] = {11, 201};
+static const int32_t MONS_Q44[] = {13, 203};
+static const int32_t MONS_Q45[] = {199};
+static const int32_t MONS_Q46[] = {207};
+static const int32_t MONS_Q47[] = {223};
+static const int32_t MONS_Q55[] = {1, 105};
+static const int32_t MONS_Q68[] = {103};
+static const int32_t MONS_Q69[] = {388};
+static const int32_t MONS_Q71[] = {17, 103};
+static const int32_t MONS_Q85[] = {131, 139};
+static const int32_t MONS_Q93[] = {186};
+static const int32_t MONS_Q94[] = {185};
+static const int32_t MONS_Q99[] = {183};
+static const int32_t MONS_Q102[] = {184};
+static const int32_t MONS_Q123[] = {190, 249};
+static const int32_t MONS_Q124[] = {236};
+static const int32_t MONS_Q132[] = {238};
+static const int32_t MONS_Q138[] = {237};
+static const int32_t MONS_Q139[] = {239};
+static const int32_t MONS_Q142[] = {305};
+static const int32_t MONS_Q144[] = {299};
+static const int32_t MONS_Q148[] = {241, 278};
+static const int32_t MONS_Q160[] = {196};
+static const int32_t MONS_Q162[] = {149, 388};
+static const int32_t MONS_Q168[] = {240};
+static const int32_t MONS_Q171[] = {343, 344, 354};
+static const int32_t MONS_Q185[] = {388, 389};
+static const int32_t MONS_Q186[] = {263};
+static const int32_t MONS_Q193[] = {161, 384};
+static const int32_t MONS_Q194[] = {151};
+static const int32_t MONS_Q195[] = {163}; /* "Sketchy Zard" - via:"none", found by hand */
+static const int32_t MONS_Q196[] = {231, 232};
+static const int32_t MONS_Q197[] = {228};
+static const int32_t MONS_Q198[] = {1, 105, 149, 388};
+static const int32_t MONS_Q199[] = {8};
+static const int32_t MONS_Q205[] = {189};
+static const int32_t MONS_Q208[] = {188};
+static const int32_t MONS_Q209[] = {188, 189, 263};
+static const int32_t MONS_Q210[] = {208};
+static const int32_t MONS_Q211[] = {133};
+static const int32_t MONS_Q212[] = {200};
+static const int32_t MONS_Q222[] = {404};
+static const int32_t MONS_Q227[] = {406};
+static const int32_t MONS_Q228[] = {407, 413};
+static const int32_t MONS_Q229[] = {405};
+static const int32_t MONS_Q232[] = {407};
+static const int32_t MONS_Q234[] = {70};
+static const int32_t MONS_Q237[] = {1, 7, 105}; /* "Zardman Spearman Defeated" - via:"none",
+   found by hand (Zardman Spear=7); 1/105 from this quest's other, already-mapped objective */
+static const int32_t MONS_Q238[] = {412};
+static const int32_t MONS_Q240[] = {153}; /* "BaconZard Rescued?" -> Bacon Zard, found by hand */
+static const int32_t MONS_Q242[] = {415, 421, 422}; /* "Find the Lucky Zard" - 3 named variants
+   (West/North/East), found by hand; any should satisfy it */
+static const int32_t MONS_Q243[] = {414};
+static const int32_t MONS_Q244[] = {423};
+
+static const QuestMonHint QUEST_MON_HINTS[] = {
+    {1, MONS_Q1, 3}, {11, MONS_Q11, 1}, {14, MONS_Q14, 1}, {19, MONS_Q19, 1},
+    {20, MONS_Q14, 1}, {23, MONS_Q23, 1}, {24, MONS_Q14, 1}, {40, MONS_Q40, 4},
+    {41, MONS_Q41, 2}, {42, MONS_Q42, 13}, {43, MONS_Q43, 2}, {44, MONS_Q44, 2},
+    {45, MONS_Q45, 1}, {46, MONS_Q46, 1}, {47, MONS_Q47, 1}, {52, MONS_Q14, 1},
+    {55, MONS_Q55, 2}, {68, MONS_Q68, 1}, {69, MONS_Q69, 1}, {71, MONS_Q71, 2},
+    {85, MONS_Q85, 2}, {93, MONS_Q93, 1}, {94, MONS_Q94, 1}, {95, MONS_Q14, 1},
+    {98, MONS_Q93, 1}, {99, MONS_Q99, 1}, {100, MONS_Q94, 1}, {102, MONS_Q102, 1},
+    {123, MONS_Q123, 2}, {124, MONS_Q124, 1}, {127, MONS_Q124, 1}, {132, MONS_Q132, 1},
+    {135, MONS_Q123, 2}, {138, MONS_Q138, 1}, {139, MONS_Q139, 1}, {142, MONS_Q142, 1},
+    {144, MONS_Q144, 1}, {148, MONS_Q148, 2}, {157, MONS_Q123, 2}, {160, MONS_Q160, 1},
+    {162, MONS_Q162, 2}, {168, MONS_Q168, 1}, {169, MONS_Q148, 2}, {171, MONS_Q171, 3},
+    {185, MONS_Q185, 2}, {186, MONS_Q186, 1}, {190, MONS_Q171, 3}, {193, MONS_Q193, 2},
+    {194, MONS_Q194, 1}, {195, MONS_Q195, 1}, {196, MONS_Q196, 2}, {197, MONS_Q197, 1},
+    {198, MONS_Q198, 4}, {199, MONS_Q199, 1}, {205, MONS_Q205, 1}, {207, MONS_Q186, 1},
+    {208, MONS_Q208, 1}, {209, MONS_Q209, 3}, {210, MONS_Q210, 1}, {211, MONS_Q211, 1},
+    {212, MONS_Q212, 1}, {221, MONS_Q99, 1}, {222, MONS_Q222, 1}, {227, MONS_Q227, 1},
+    {228, MONS_Q228, 2}, {229, MONS_Q229, 1}, {232, MONS_Q232, 1}, {234, MONS_Q234, 1},
+    {235, MONS_Q234, 1}, {236, MONS_Q69, 1}, {237, MONS_Q237, 3}, {238, MONS_Q238, 1},
+    {239, MONS_Q237, 3}, {240, MONS_Q240, 1}, {241, MONS_Q55, 2}, {242, MONS_Q242, 3},
+    {243, MONS_Q243, 1}, {244, MONS_Q244, 1},
+};
+#define QUEST_MON_HINT_COUNT ((int)(sizeof(QUEST_MON_HINTS) / sizeof(QUEST_MON_HINTS[0])))
+
+static bool quest_mon_hint(int32_t qid, const int32_t **out_mons, int *out_count)
+{
+    for (int i = 0; i < QUEST_MON_HINT_COUNT; i++) {
+        if (QUEST_MON_HINTS[i].qid == qid) {
+            *out_mons = QUEST_MON_HINTS[i].mons;
+            *out_count = QUEST_MON_HINTS[i].count;
+            return true;
+        }
+    }
+    return false;
+}
+
+/* Per-quest turn-in location, baked in from the same questdb source as
+   QUEST_MON_HINTS - mirrors QuestRunner.AtTurnInLocation. Every entry here
+   turns in on the SAME MAP the quest is hunted on (confirmed against the DB
+   for all four chains), just not always the same FRAME - e.g. quest 20 hunts
+   in Enter but turns in at R3, quest 59 hunts at R8 but turns in back at
+   Enter. Without this, RequestTryQuestComplete fired from wherever combat
+   happened to end, which works by accident when hunt and turn-in frames
+   match and silently no-ops (or worse, looks like a kick-worthy location
+   mismatch to live AE) when they don't. */
+typedef struct {
+    int32_t qid;
+    const char *frame;
+    const char *pad;
+} QuestTurnin;
+
+/* Every quest in server/db.py's questdb (180 entries), not just the 4 named
+   chains - same source/generation as QUEST_MON_HINTS above. turnInMap never
+   differs from the hunt map for any quest in our DB, only turnInFrame/Pad
+   sometimes do, which is why this table (like the RequestMoveToCell it
+   feeds) only ever needs a frame+pad, never a full-area transfer. */
+static const QuestTurnin QUEST_TURNINS[] = {
+    {1, "Enter", "Spawn"},       {2, "Enter", "Spawn"},        {4, "Enter", "Spawn"},
+    {5, "R4", "Spawn"},          {6, "R4", "Spawn"},           {7, "R4", "Spawn"},
+    {8, "Enter", "Spawn"},       {9, "Enter", "Spawn"},        {10, "Enter", "Spawn"},
+    {11, "Enter", "Spawn"},      {12, "Enter", "Spawn"},       {13, "Enter", "Spawn"},
+    {14, "Enter", "Spawn"},      {15, "Enter", "Spawn"},       {16, "Enter", "Spawn"},
+    {17, "Enter", "Spawn"},      {18, "Enter", "Spawn"},       {19, "Enter", "Down"},
+    {20, "R3", "Spawn"},         {21, "Enter", "Spawn"},       {22, "Enter", "Spawn"},
+    {23, "Enter", "Spawn"},      {24, "Enter", "Spawn"},       {40, "R4", "Spawn"},
+    {41, "R5", "Spawn"},         {42, "R4", "Spawn"},          {43, "R4", "Spawn"},
+    {44, "R4", "Spawn"},         {45, "R6", "Spawn"},          {46, "R6", "Spawn"},
+    {47, "R7", "Spawn"},         {49, "Enter", "Spawn"},       {50, "Enter", "Spawn"},
+    {51, "Enter", "Spawn"},      {52, "Enter", "Spawn"},       {55, "Enter", "Spawn"},
+    {56, "16", "17"},            {57, "Enter", "Spawn"},       {58, "Enter", "Spawn"},
+    {59, "Enter", "Spawn"},      {63, "Enter", "Spawn"},       {64, "Enter", "Spawn"},
+    {65, "Enter", "Spawn"},      {66, "Enter", "Spawn"},       {67, "Enter", "Spawn"},
+    {68, "Enter", "Spawn"},      {69, "Enter", "Spawn"},       {70, "Enter", "Spawn"},
+    {71, "Enter", "Spawn"},      {72, "Enter", "Spawn"},       {85, "R12", "Spawn"},
+    {93, "Enter", "Spawn"},      {94, "Enter", "Spawn"},       {95, "Enter", "Spawn"},
+    {96, "Enter", "Spawn"},      {97, "Enter", "Spawn"},       {98, "Enter", "Spawn"},
+    {99, "Enter", "Spawn"},      {100, "Enter", "Spawn"},      {101, "Enter", "Spawn"},
+    {102, "Enter", "Spawn"},     {103, "Enter", "Spawn"},      {104, "Enter", "Spawn"},
+    {105, "Enter", "Spawn"},     {106, "Enter", "Spawn"},      {107, "Enter", "Spawn"},
+    {108, "R10", "Spawn"},       {109, "R2", "Spawn"},         {118, "Enter", "Spawn"},
+    {119, "R2", "Down"},         {120, "Enter", "Spawn"},      {121, "R2", "Down"},
+    {122, "R2", "Down"},         {123, "R2", "Down"},          {124, "R2", "Down"},
+    {125, "R2", "Down"},         {127, "R15", "Up"},           {128, "Enter", "Spawn"},
+    {129, "Enter", "Spawn"},     {130, "Enter", "Spawn"},      {132, "R16", "Left"},
+    {133, "Enter", "Spawn"},     {134, "Enter", "Spawn"},      {135, "Enter", "Spawn"},
+    {136, "R17", "Spawn"},       {137, "R14", "Spawn"},        {138, "R14", "Spawn"},
+    {139, "Enter", "Spawn"},     {140, "Enter", "Spawn"},      {142, "R17", "Spawn"},
+    {143, "R17-empty", "Spawn"}, {144, "R12-empty", "Spawn"},  {146, "R12-empty", "Spawn"},
+    {148, "R16-empty", "Spawn"}, {149, "R2", "Spawn"},         {150, "Enter", "Spawn"},
+    {151, "Enter", "Down"},      {152, "Enter", "Spawn"},      {153, "Enter", "Spawn"},
+    {154, "Enter", "Spawn"},     {156, "R15", "Spawn"},        {157, "Enter", "Spawn"},
+    {158, "Enter", "Down"},      {159, "R2", "Down"},          {160, "R2", "Down"},
+    {161, "Enter", "Spawn"},     {162, "Enter", "Maya"},       {163, "R16", "Down"},
+    {164, "R15", "Down"},        {166, "R8", "Spawn"},         {167, "Enter", "Spawn"},
+    {168, "Enter", "Spawn"},     {169, "Enter", "Spawn"},      {170, "R6", "Spawn"},
+    {171, "R6", "Up"},           {172, "R4", "Right"},         {173, "R5", "Spawn"},
+    {174, "R4", "Right"},        {175, "PrincessFight", "Spawn"}, {177, "PrincessFight", "Spawn"},
+    {178, "R5", "Spawn"},        {179, "R2", "Right"},         {182, "Enter", "Spawn"},
+    {183, "Enter", "Spawn"},     {184, "Enter", "Spawn"},      {185, "Enter", "Spawn"},
+    {186, "Enter", "spawn"},     {187, "Enter", "Spawn"},      {188, "Enter", "Spawn"},
+    {189, "Enter", "Spawn"},     {190, "Enter", "Spawn"},      {191, "Enter", "Spawn"},
+    {192, "Enter", "Spawn"},     {193, "Enter", "Spawn"},      {194, "Enter", "Spawn"},
+    {195, "Enter", "Spawn"},     {196, "Enter", "Spawn"},      {197, "Enter", "Spawn"},
+    {198, "Enter", "Right"},     {199, "Enter", "Spawn"},      {203, "Enter", "spawn"},
+    {204, "Enter", "spawn"},     {205, "Enter", "spawn"},      {207, "Enter", "spawn"},
+    {208, "Enter", "spawn"},     {209, "Enter", "spawn"},      {210, "Enter", "spawn"},
+    {211, "Enter", "spawn"},     {212, "Enter", "spawn"},      {213, "Enter", "Spawn"},
+    {214, "Enter", "Spawn"},     {215, "Enter", "Spawn"},      {216, "Enter", "Spawn"},
+    {217, "Enter", "Spawn"},     {218, "Enter", "Spawn"},      {220, "Enter", "spawn"},
+    {221, "Enter", "spawn"},     {222, "Enter", "spawn"},      {223, "Enter", "spawn"},
+    {225, "Enter", "spawn"},     {226, "Enter", "spawn"},      {227, "Enter", "spawn"},
+    {228, "Enter", "spawn"},     {229, "Enter", "spawn"},      {230, "Enter", "spawn"},
+    {232, "Enter", "spawn"},     {233, "Enter", "spawn"},      {234, "R13-Petshop", "right"},
+    {235, "R13-Petshop", "right"}, {236, "Enter", "spawn"},    {237, "Enter", "spawn"},
+    {238, "Enter", "spawn"},     {239, "Enter", "spawn"},      {240, "Enter", "spawn"},
+    {241, "Enter", "spawn"},     {242, "Enter", "spawn"},      {243, "Enter", "spawn"},
+    {244, "Enter", "spawn"},     {6942, "Enter", "spawn"},     {6943, "Enter", "spawn"},
+};
+#define QUEST_TURNIN_COUNT ((int)(sizeof(QUEST_TURNINS) / sizeof(QUEST_TURNINS[0])))
+
+static const QuestTurnin *quest_turnin_loc(int32_t qid)
+{
+    for (int i = 0; i < QUEST_TURNIN_COUNT; i++) {
+        if (QUEST_TURNINS[i].qid == qid) {
+            return &QUEST_TURNINS[i];
+        }
+    }
+    return NULL;
+}
+
+/* True when `mon` is something the current objective actually wants killed.
+
+   PERMISSIVE UNION of two signals, mirroring QuestRunner.MatchesTarget:
+   the baked per-quest hint table above (works even when RefArray is empty,
+   which on live AE it always is for these quests), and RefArray MonIDs
+   directly (in case some quest somewhere DOES ship them - costs nothing to
+   still check). Only when NEITHER offers anything does any hostile qualify -
+   an unmapped quest should still let the bot grind the room rather than
+   stall dead. */
+static bool matches_objective(void *mon, void *obj, int32_t qotype, int32_t qid)
+{
+    if (obj == NULL || qotype != 1 /* Killcount */ || g_entity_get_id == NULL) {
+        return true; /* no signal to filter on - any hostile is fair game */
+    }
+    int32_t mon_id = inv_int(g_entity_get_id, mon, NULL);
+    bool has_signal = false;
+
+    const int32_t *hint_mons = NULL;
+    int hint_count = 0;
+    if (quest_mon_hint(qid, &hint_mons, &hint_count)) {
+        has_signal = true;
+        for (int i = 0; i < hint_count; i++) {
+            if (hint_mons[i] == mon_id) {
+                return true;
+            }
+        }
+    }
+
+    if (g_qti_getrefint_method != NULL) {
+        for (int32_t i = 0; i < 8; i++) {
+            void *ref_args[1] = {&i};
+            int32_t want = inv_int(g_qti_getrefint_method, obj, ref_args);
+            if (want <= 0) {
+                continue; /* -1/0 = absent or non-numeric ref; keep scanning */
+            }
+            has_signal = true;
+            if (want == mon_id) {
+                return true;
+            }
+        }
+    }
+
+    return !has_signal;
+}
+
+static void *find_nearest_hostile(void *player, const float me[3], void *obj, int32_t qotype,
+                                   int32_t qid)
 {
     if (g_area_currentarea_field == NULL || g_area_monsters_field == NULL ||
         g_monster_reaction_field == NULL || !il2cpp_field_static_get_value) {
@@ -1447,30 +1965,40 @@ static void *find_nearest_hostile(void *player, const float me[3])
         return NULL;
     }
     void *dict_class = il2cpp_object_get_class(dict);
-    void *get_enumerator = il2cpp_class_get_method_from_name(dict_class, "GetEnumerator", 0);
-    void *boxed_enum = get_enumerator ? inv(get_enumerator, dict, NULL) : NULL;
-    void *enum_raw = boxed_enum ? il2cpp_object_unbox(boxed_enum) : NULL;
-    if (enum_raw == NULL) {
+    EnumWalk w;
+    if (!enum_open(dict, il2cpp_class_get_method_from_name(dict_class, "GetEnumerator", 0), &w)) {
         return NULL;
     }
-    void *enum_class = il2cpp_object_get_class(boxed_enum);
-    void *move_next = il2cpp_class_get_method_from_name(enum_class, "MoveNext", 0);
-    void *get_current = il2cpp_class_get_method_from_name(enum_class, "get_Current", 0);
-    if (move_next == NULL || get_current == NULL) {
-        return NULL;
+
+    /* Only consider monsters standing in the player's own cell. The game
+       spawns every cell's monsters into one Monsters dict, so without this
+       the "nearest" hostile can be one in a completely different room that
+       happens to sit close in world coordinates - unreachable, and it stalls
+       the hunt on a target that can never be engaged. Compared case-
+       insensitively on purpose: the game's own GetMonstersInFrame does an
+       ordinal compare and consequently misses monsters whose Frame casing
+       differs from the player's. */
+    char my_frame[40] = "";
+    if (g_entity_frame_field != NULL) {
+        void *fs = NULL;
+        il2cpp_field_get_value(player, g_entity_frame_field, &fs);
+        mstr_to_utf8(fs, my_frame, sizeof(my_frame));
     }
 
     void *best = NULL;
     float best_dist2 = 0.0f;
-    for (int i = 0; i < 500 && inv_bool(move_next, enum_raw, NULL); i++) {
-        void *boxed_kv = inv(get_current, enum_raw, NULL);
-        void *kv_raw = boxed_kv ? il2cpp_object_unbox(boxed_kv) : NULL;
-        if (kv_raw == NULL) {
+    void *current = g_entity_get_target ? inv(g_entity_get_target, player, NULL) : NULL;
+    bool current_ok = false;
+
+    for (int i = 0; i < 500 && inv_bool(w.move_next, w.self, NULL); i++) {
+        void *boxed_kv = inv(w.get_current, w.self, NULL);
+        void *kv_self = self_ptr(boxed_kv);
+        if (kv_self == NULL) {
             continue;
         }
         void *kv_class = il2cpp_object_get_class(boxed_kv);
         void *get_value = il2cpp_class_get_method_from_name(kv_class, "get_Value", 0);
-        void *mon = get_value ? inv(get_value, kv_raw, NULL) : NULL;
+        void *mon = get_value ? inv(get_value, kv_self, NULL) : NULL;
         if (mon == NULL || mon == player) {
             continue;
         }
@@ -1483,6 +2011,26 @@ static void *find_nearest_hostile(void *player, const float me[3])
             inv_int(g_entity_get_currentstate, mon, NULL) == 0) { /* State.Dead */
             continue;
         }
+        if (my_frame[0] != '\0' && g_entity_frame_field != NULL) {
+            char mf[40] = "";
+            void *fs = NULL;
+            il2cpp_field_get_value(mon, g_entity_frame_field, &fs);
+            mstr_to_utf8(fs, mf, sizeof(mf));
+            if (mf[0] != '\0' && strcasecmp(mf, my_frame) != 0) {
+                continue;
+            }
+        }
+        if (!matches_objective(mon, obj, qotype, qid)) {
+            continue;
+        }
+        /* Sticky targeting: if what we are already fighting still qualifies,
+           keep it. Re-picking purely by distance every 0.3s makes the bot
+           oscillate between two equally-close mobs and land almost no hits -
+           the desktop agent hit this exact failure against the pair of water
+           draconians that flank the player on Lair. */
+        if (mon == current) {
+            current_ok = true;
+        }
         float pos[3];
         if (!read_local_pos(mon, pos)) {
             continue;
@@ -1494,15 +2042,234 @@ static void *find_nearest_hostile(void *player, const float me[3])
             best_dist2 = d2;
         }
     }
-    return best;
+    return current_ok ? current : best;
+}
+
+/* The frame (map-wide, every cell - not just the player's own) holding the
+   most matching hostiles for the given objective. Mirrors
+   QuestRunner.FindHostileFrame: Area.currentArea.Monsters carries every
+   monster in the WHOLE MAP regardless of which cell is currently active, so
+   this is a pure lookup, not a scan-as-you-walk. Needed because a chain's
+   fixed entry frame does not always hold the objective's target - Lair's
+   Wyverns (quest 20) live in R2/R3 while the chain parks the player in
+   Enter, which is full of Water Draconians (quest 19's target). Returns
+   false if nothing anywhere matches. */
+static bool find_hostile_frame(void *obj, int32_t qotype, int32_t qid, char *out_frame,
+                                size_t out_cap)
+{
+    out_frame[0] = '\0';
+    if (g_area_currentarea_field == NULL || g_area_monsters_field == NULL ||
+        g_monster_reaction_field == NULL || g_entity_frame_field == NULL ||
+        !il2cpp_field_static_get_value) {
+        return false;
+    }
+    void *area = NULL;
+    il2cpp_field_static_get_value(g_area_currentarea_field, &area);
+    if (area == NULL) {
+        return false;
+    }
+    void *dict = NULL;
+    il2cpp_field_get_value(area, g_area_monsters_field, &dict);
+    if (dict == NULL) {
+        return false;
+    }
+    void *dict_class = il2cpp_object_get_class(dict);
+    EnumWalk w;
+    if (!enum_open(dict, il2cpp_class_get_method_from_name(dict_class, "GetEnumerator", 0), &w)) {
+        return false;
+    }
+
+    /* Tally match counts per frame (case-insensitive), same as the desktop's
+       byFrame dictionary, so a frame with 3 Wyverns wins over one with 1. A
+       small fixed table beats pulling in a hash map for at most a
+       handful of distinct frames per map. */
+    char frames[16][40];
+    int counts[16];
+    int nframes = 0;
+
+    for (int i = 0; i < 500 && inv_bool(w.move_next, w.self, NULL); i++) {
+        void *boxed_kv = inv(w.get_current, w.self, NULL);
+        void *kv_self = self_ptr(boxed_kv);
+        if (kv_self == NULL) {
+            continue;
+        }
+        void *kv_class = il2cpp_object_get_class(boxed_kv);
+        void *get_value = il2cpp_class_get_method_from_name(kv_class, "get_Value", 0);
+        void *mon = get_value ? inv(get_value, kv_self, NULL) : NULL;
+        if (mon == NULL) {
+            continue;
+        }
+        int32_t reaction = 0;
+        il2cpp_field_get_value(mon, g_monster_reaction_field, &reaction);
+        if (reaction != 1) {
+            continue;
+        }
+        if (g_entity_get_currentstate != NULL &&
+            inv_int(g_entity_get_currentstate, mon, NULL) == 0) {
+            continue;
+        }
+        if (!matches_objective(mon, obj, qotype, qid)) {
+            continue;
+        }
+        char mf[40] = "";
+        void *fs = NULL;
+        il2cpp_field_get_value(mon, g_entity_frame_field, &fs);
+        mstr_to_utf8(fs, mf, sizeof(mf));
+        if (mf[0] == '\0') {
+            continue;
+        }
+        int slot = -1;
+        for (int j = 0; j < nframes; j++) {
+            if (strcasecmp(frames[j], mf) == 0) {
+                slot = j;
+                break;
+            }
+        }
+        if (slot < 0 && nframes < 16) {
+            slot = nframes++;
+            snprintf(frames[slot], sizeof(frames[slot]), "%s", mf);
+            counts[slot] = 0;
+        }
+        if (slot >= 0) {
+            counts[slot]++;
+        }
+    }
+
+    int best = -1;
+    for (int j = 0; j < nframes; j++) {
+        if (best < 0 || counts[j] > counts[best]) {
+            best = j;
+        }
+    }
+    if (best < 0) {
+        return false;
+    }
+    snprintf(out_frame, out_cap, "%s", frames[best]);
+    return true;
+}
+
+/* approach_target's give-up clock: how long we have been trying to reach the
+   CURRENT target without success. Reset whenever the target moves (a new
+   machine/NPC, or the same one at a materially different spot) so switching
+   targets does not inherit a stale clock. */
+static float g_approach_target_last[3] = {1e9f, 1e9f, 1e9f};
+static float g_approach_started_at;
+#define APPROACH_GIVEUP_SEC 1.5f /* was 4.0 - a target the pathing genuinely cannot reach (e.g. a
+                                     DSPiece across a lava pit the A* grid correctly refuses to
+                                     route through) fails on every attempt regardless of how long
+                                     we wait, so a shorter timeout costs nothing there and just
+                                     gets to the "click anyway" fallback faster; a real walk at
+                                     ~14 units/sec covers far more ground than any of these rooms
+                                     need in 1.5s anyway */
+
+/* Wall-aware approach shared by combat engage (hunt_tick) and machine/NPC
+   interact (quest_tick's Interact/Apop branches). Returns true once `me` is
+   within reach_dist of `target` - the caller clicks on true, keeps waiting
+   on false. Before this, Interact/Apop clicked the moment a machine/NPC was
+   FOUND, with no regard for whether the player was anywhere near it - PC
+   requires <=2.5 units and a clear line before clicking, and paths there
+   (same A* used for combat) if not.
+
+   PC's other half of this - clicking anyway once PathWalker.Failed, since "a
+   machine click needs no proximity" - has no clean equivalent here: path_tick
+   folds "no route at all", "stalled twice", and "reached the goal" into the
+   same false return, so the caller cannot tell failure from arrival. A
+   give-up timer sidesteps that distinction entirely and generalizes better
+   anyway: whatever the actual cause (an interactable embedded in geometry
+   the A* grid cannot reach, a planning bug, bad terrain), 4 seconds of not
+   converging on a STATIONARY target means it is not going to converge.
+   Without this, a DSPiece embedded in a wall walked the character into it
+   forever - visually "just approaching", reported as looking like the
+   character was clipping against something it should have been able to
+   reach ("can we turn on no clip?"). */
+static bool approach_target(void *player, const float me[3], const float target[3],
+                            float reach_dist)
+{
+    float dx = target[0] - me[0], dy = target[1] - me[1];
+    float dist = sqrtf(dx * dx + dy * dy);
+    if (dist <= reach_dist) {
+        g_path_active = 0; /* in reach - no route left to maintain */
+        g_approach_started_at = 0.0f;
+        return true;
+    }
+
+    float now = inv_float(g_time_get_time, NULL, NULL);
+    float tdx = target[0] - g_approach_target_last[0], tdy = target[1] - g_approach_target_last[1];
+    if (tdx * tdx + tdy * tdy > 1.0f) {
+        /* New target (or this one moved meaningfully) - fresh clock. */
+        memcpy(g_approach_target_last, target, sizeof(g_approach_target_last));
+        g_approach_started_at = now;
+    } else if (g_approach_started_at <= 0.0f) {
+        g_approach_started_at = now;
+    } else if (now - g_approach_started_at > APPROACH_GIVEUP_SEC) {
+        LOGI("hunt: approach gave up after %.1fs (dist=%.1f) - interacting anyway", now -
+             g_approach_started_at, dist);
+        g_approach_started_at = 0.0f;
+        return true;
+    }
+
+    if (g_emu_type_obj == NULL || g_emu_walkto == NULL) {
+        return false; /* can't walk - let the caller decide (click anyway, or wait) */
+    }
+    void *player_go = inv(g_entity_getgameobject, player, NULL);
+    void *emu = get_component(player_go, g_emu_type_obj);
+    if (emu == NULL) {
+        return false;
+    }
+    float speed = 14.0f;
+    if (g_emu_cellspeed_field != NULL && il2cpp_field_static_get_value) {
+        int32_t cs = 14;
+        il2cpp_field_static_get_value(g_emu_cellspeed_field, &cs);
+        speed = (float)cs;
+    }
+    void *parent = path_player_parent(player_go);
+    bool clear = parent != NULL && path_line_clear_local(parent, me, target);
+    if (clear) {
+        g_path_active = 0;
+        void *args[2] = {(void *)target, &speed};
+        inv(g_emu_walkto, emu, args);
+    } else {
+        bool done = false;
+        bool navigating = parent != NULL && path_tick(parent, emu, target, speed, &done);
+        if (!navigating) {
+            void *args[2] = {(void *)target, &speed};
+            inv(g_emu_walkto, emu, args);
+        }
+    }
+    return false;
 }
 
 static void hunt_tick(void)
 {
+    float now0 = inv_float(g_time_get_time, NULL, NULL);
+
+    /* Interact/Apop approach, published by quest_tick's Interact/Talk/Apop
+       branches. This runs regardless of g_hunt (which those branches set to
+       0 - a machine click needs the player still, not chasing a mob) and at
+       hunt_tick's own ~3Hz cadence, NOT quest_tick's 1Hz decision cadence.
+       Calling approach_target from inside quest_tick directly re-issued the
+       walk only once a second, which is far too sparse to sustain the
+       continuous movement combat's own approach relies on at this same
+       cadence - the character advanced in tiny, second-apart nudges that
+       looked and reported as "stuck approaching" even though the logic was
+       otherwise correct. quest_tick still decides WHAT to approach and
+       fires the actual click; this just keeps the walk moving in between. */
+    if (g_interact_approach_active && now0 >= g_next_interact_approach) {
+        g_next_interact_approach = now0 + 0.3f;
+        void *iplayer = g_get_main_player ? inv(g_get_main_player, NULL, NULL) : NULL;
+        float ime[3];
+        if (iplayer != NULL && read_local_pos(iplayer, ime)) {
+            g_interact_ready = approach_target(iplayer, ime, g_interact_approach_target,
+                                               g_interact_reach_dist_pub)
+                                  ? 1
+                                  : 0;
+        }
+    }
+
     if (!g_hunt || g_get_main_player == NULL) {
         return;
     }
-    float now = inv_float(g_time_get_time, NULL, NULL);
+    float now = now0;
     if (now < g_next_hunt) {
         return;
     }
@@ -1535,7 +2302,55 @@ static void hunt_tick(void)
         return;
     }
 
-    void *tgt = find_nearest_hostile(player, me);
+    void *tgt = find_nearest_hostile(player, me, g_hunt_obj, g_hunt_qotype, g_hunt_qid);
+    if (tgt == NULL) {
+        /* No live target to engage this tick - mirrors QuestRunner calling
+           StopAutoskills() as soon as PickBestHostile returns null, whether
+           that's because we're mid cross-cell travel or nothing anywhere
+           matches yet. Re-armed below once engage actually happens. */
+        g_autoskills = 0;
+    }
+    if (tgt == NULL && g_hunt_obj != NULL) {
+        /* Nothing matching in THIS cell, but the objective does name a real
+           target (Killcount with a hint/RefArray hit) - search the whole map
+           before giving up on it. Dropping the filter here (old behavior)
+           defeated the entire point: Lair's chain always parks the player in
+           Enter, but quest 20's Wyverns live in R2/R3, so "any hostile
+           nearby" just meant fighting whatever quest 19 wanted instead. */
+        char here[40] = "";
+        if (g_entity_frame_field != NULL) {
+            void *fs = NULL;
+            il2cpp_field_get_value(player, g_entity_frame_field, &fs);
+            mstr_to_utf8(fs, here, sizeof(here));
+        }
+        char want_frame[40];
+        if (find_hostile_frame(g_hunt_obj, g_hunt_qotype, g_hunt_qid, want_frame,
+                                sizeof(want_frame)) &&
+            strcasecmp(want_frame, here) != 0) {
+            bool need_send = strcasecmp(g_hunt_nav_frame, want_frame) != 0 ||
+                              (now - g_hunt_nav_sent_at > 8.0f); /* matches QuestRunner.NavResendSec */
+            if (need_send && g_req_movecell_class != NULL && g_req_movecell_ctor != NULL &&
+                il2cpp_object_new && il2cpp_string_new && g_send_request != NULL) {
+                void *req = il2cpp_object_new(g_req_movecell_class);
+                if (req != NULL) {
+                    void *ctor_args[2] = {il2cpp_string_new(want_frame),
+                                          il2cpp_string_new("Spawn")};
+                    inv(g_req_movecell_ctor, req, ctor_args);
+                    void *send_args[1] = {req};
+                    inv(g_send_request, g_aec_instance, send_args);
+                    LOGI("hunt: nothing matching in '%s' - moving to '%s' for quest %d", here,
+                         want_frame, g_hunt_qid);
+                }
+                snprintf(g_hunt_nav_frame, sizeof(g_hunt_nav_frame), "%s", want_frame);
+                g_hunt_nav_sent_at = now;
+            }
+            return; /* wait for the cell to load before engaging anything */
+        }
+        /* Nowhere on the map has a match either - the hint/RefArray may just
+           not cover this quest. Fall back to any hostile rather than
+           stalling forever. */
+        tgt = find_nearest_hostile(player, me, NULL, -1, -1);
+    }
     if (tgt == NULL) {
         return; /* nothing hostile loaded - wait for one to spawn/appear */
     }
@@ -1553,6 +2368,15 @@ static void hunt_tick(void)
        skipping the two managed calls entirely when nothing changed is cheap
        and avoids re-triggering the charge animation every 0.3s. */
     void *current_target = g_entity_get_target ? inv(g_entity_get_target, player, NULL) : NULL;
+    if (current_target != tgt) {
+        int32_t tgt_id = g_entity_get_id ? inv_int(g_entity_get_id, tgt, NULL) : -999;
+        char tgt_name[40] = "";
+        if (g_entity_get_name != NULL) {
+            mstr_to_utf8(inv(g_entity_get_name, tgt, NULL), tgt_name, sizeof(tgt_name));
+        }
+        LOGI("hunt: retarget -> id=%d name='%s' (hunt_qid=%d hunt_qotype=%d hunt_obj=%p)",
+             tgt_id, tgt_name, g_hunt_qid, g_hunt_qotype, g_hunt_obj);
+    }
     if (current_target != tgt && g_targetable_type_obj != NULL) {
         void *tgt_go = inv(g_entity_getgameobject, tgt, NULL);
         void *targetable = get_component(tgt_go, g_targetable_type_obj);
@@ -1794,6 +2618,11 @@ static void send_typed_packet(void)
 static void *g_uiquesttracker_get_currentquest; /* static UIQuestTracker.get_CurrentQuest() */
 static void *g_quest_get;                       /* static Quest.Get(int) - chain mode only */
 static void *g_quest_get_id;                    /* Quest.get_ID()                          */
+static void *g_quest_npcid_field;               /* Quest.NPCID - Apop/Talk NPC fallback when
+                                                    the objective's own apopID isn't usable  */
+static void *g_req_apopqo_class;
+static void *g_req_apopqo_ctor;                 /* RequestOpenApopQO(int apopid, int monMapID) */
+static void *g_monster_get_monmapid;            /* Monster.get_monMapID()                  */
 static void *g_quest_is_ready_turnin;           /* Quest.IsReadyForTurnin()                */
 static void *g_player_is_quest_accepted;        /* Player.IsQuestAccepted(int)             */
 static void *g_req_accept_class;
@@ -1802,6 +2631,10 @@ static void *g_req_turnin_class;
 static void *g_req_turnin_ctor;                 /* RequestTryQuestComplete(int,int)        */
 static void *g_req_transfer_class;
 static void *g_req_transfer_ctor;               /* RequestMoveToArea(string,string,string,string,string) */
+static void *g_req_cutscene_class;
+static void *g_req_cutscene_ctor;               /* RequestWatchCutscene(int)                */
+static float g_next_interact;   /* throttles machine/NPC clicks and cutscene requests -
+                                    see quest_tick's Interact/Talk/Apop/Cutscene branches */
 static void *g_area_get_mapname;                /* Area.get_mapName() - confirms chain-mode arrival
                                                     before accepting; see quest_tick's chain branch */
 static float g_chain_tfer_sent_at;
@@ -1820,17 +2653,23 @@ static void *g_system_array_class;     /* System.Array - see next_incomplete_obj
                                           rather than on the array's own concrete class */
 static void *g_qti_qoid_field;
 static void *g_qti_qotype_field;
-static void *g_qti_getrefint_method;   /* QuestTurninItem.GetRefInt(int) - avoids ever
-                                          touching RefArray's own array storage directly */
-static void *g_qti_refscontains_method;/* QuestTurninItem.RefsContains(string) */
+static void *g_qti_refscontains_method;/* QuestTurninItem.RefsContains(string) - exact match
+                                          only; kept for the Killcount RefInt path, but NOT used
+                                          for machine matching any more - see g_qti_refarray_field */
+static void *g_qti_refarray_field;     /* QuestTurninItem.RefArray (string[]) - read directly so
+                                          machine names can be tiered exact/prefix/contains
+                                          matched like MapNav.MatchTier, instead of RefsContains'
+                                          exact-only Array.Contains (which is why quest 59's
+                                          "DSPiece" ref never matched actual pieces named
+                                          "DSPiece1".."DSPiece6") */
 static void *g_player_quests_field;    /* Player.Quests (PlayerQuestData) */
 static void *g_pqd_is_objective_complete; /* PlayerQuestData.IsObjectiveComplete(int) */
+static void *g_pqd_is_quest_complete;     /* PlayerQuestData.isQuestComplete(int) - whether the
+                                              WHOLE quest has ever been turned in, not just one
+                                              objective; used to resume a chain instead of
+                                              replaying it from the top every time */
 static void *g_area_cells_field;       /* Area.Cells (Dictionary<string,MapCell>) */
-static void *g_entity_frame_field;     /* Entity.Frame (string) */
 static void *g_entity_apopid_field;    /* Entity.apopID (int, default -1) */
-static void *g_component_get_transform; /* Component.get_transform() - MapCell is a Component,
-                                           not a GameObject, so this is a separate resolution
-                                           from GameObject.get_transform */
 static void *g_transform_get_childcount;
 static void *g_transform_get_child;     /* Transform.GetChild(int) */
 static void *g_transform_get_gameobject;
@@ -1841,18 +2680,93 @@ static void *g_mapmachine_interact;     /* MapMachine.Interact() */
 static void *g_npcbutton_type_obj;
 static void *g_npcbutton_interact;      /* NPCButton.Interact() */
 
+/* A QuestTurninItem's RefArray tokens, read once up front rather than
+   re-walked per candidate machine. Fixed-size: RefArray is authored data
+   (a handful of names/ids at most), not a dynamic list. */
+typedef struct {
+    char tok[16][40];
+    int count;
+} RefTokens;
+
+/* Reads QuestTurninItem.RefArray (string[]) directly instead of going
+   through RefsContains(). RefArray is a plain array of strings, same
+   enumerator-walk technique as every other collection in this file. */
+static void qti_ref_tokens(void *qti, RefTokens *out)
+{
+    out->count = 0;
+    if (qti == NULL || g_qti_refarray_field == NULL || g_system_array_class == NULL) {
+        return;
+    }
+    void *arr = NULL;
+    il2cpp_field_get_value(qti, g_qti_refarray_field, &arr);
+    if (arr == NULL) {
+        return;
+    }
+    void *get_enumerator =
+        il2cpp_class_get_method_from_name(g_system_array_class, "GetEnumerator", 0);
+    EnumWalk w;
+    if (!enum_open(arr, get_enumerator, &w)) {
+        return;
+    }
+    for (int i = 0; i < 16 && inv_bool(w.move_next, w.self, NULL); i++) {
+        void *s = inv(w.get_current, w.self, NULL);
+        mstr_to_utf8(s, out->tok[out->count], sizeof(out->tok[out->count]));
+        if (out->tok[out->count][0] != '\0') {
+            out->count++;
+        }
+    }
+}
+
+/* Case-insensitive "does hay contain needle anywhere" - no strcasestr
+   dependency (a GNU extension not guaranteed present in bionic libc). */
+static bool ci_contains(const char *hay, const char *needle)
+{
+    size_t hn = strlen(hay), nn = strlen(needle);
+    if (nn == 0 || nn > hn) {
+        return false;
+    }
+    for (size_t i = 0; i + nn <= hn; i++) {
+        if (strncasecmp(hay + i, needle, nn) == 0) {
+            return true;
+        }
+    }
+    return false;
+}
+
+/* Tiered exact/prefix/contains match, mirroring MapNav.MatchTier. RefsContains
+   (Array.Contains, exact-only) is why quest 59 never found anything: its ref
+   is the bare prefix "DSPiece", but the actual machines are individually
+   named "DSPiece1".."DSPiece6" - no exact match ever exists for any of them,
+   only a prefix one. */
+static bool machine_name_matches(const char *name, const RefTokens *refs)
+{
+    for (int i = 0; i < refs->count; i++) {
+        const char *tok = refs->tok[i];
+        if (tok[0] == '\0') {
+            continue;
+        }
+        if (strcasecmp(name, tok) == 0) {
+            return true;
+        }
+        if (strncasecmp(name, tok, strlen(tok)) == 0) {
+            return true;
+        }
+        if (ci_contains(name, tok) || ci_contains(tok, name)) {
+            return true;
+        }
+    }
+    return false;
+}
+
 /* Interact objectives: recursive search of a cell's transform subtree for a
-   MapMachine whose GameObject name the objective's own RefsContains()
-   accepts - called, not reimplemented, same reasoning as IsReadyForTurnin.
+   MapMachine whose GameObject name matches the objective's RefArray tokens.
    No FindObjectsByType here (the generic overload this shim has no path to
-   resolve) - walking the CURRENT CELL's subtree is narrower than the
-   desktop's whole-map MapNav scan, but the current cell is where an
-   interactable has to be reached anyway. A machine in a different,
-   not-yet-visited cell will not be found - logged as such, not silently. */
-static void *find_machine_in_subtree(void *transform, void *qti, int depth)
+   resolve) - walking a cell's subtree one at a time (see find_machine_frame
+   for map-wide) stands in for the desktop's single whole-map MapNav scan. */
+static void *find_machine_in_subtree(void *transform, const RefTokens *refs, int depth)
 {
     if (transform == NULL || depth > 14 || g_mapmachine_type_obj == NULL ||
-        g_qti_refscontains_method == NULL || g_object_get_name == NULL) {
+        g_object_get_name == NULL || refs->count == 0) {
         return NULL;
     }
     void *go = g_transform_get_gameobject ? inv(g_transform_get_gameobject, transform, NULL)
@@ -1860,11 +2774,10 @@ static void *find_machine_in_subtree(void *transform, void *qti, int depth)
     void *machine = go ? get_component(go, g_mapmachine_type_obj) : NULL;
     if (machine != NULL) {
         void *name_str = inv(g_object_get_name, go, NULL);
-        if (name_str != NULL) {
-            void *args[1] = {name_str};
-            if (inv_bool(g_qti_refscontains_method, qti, args)) {
-                return machine;
-            }
+        char name[64] = "";
+        mstr_to_utf8(name_str, name, sizeof(name));
+        if (name[0] != '\0' && machine_name_matches(name, refs)) {
+            return machine;
         }
     }
     if (g_transform_get_childcount == NULL || g_transform_get_child == NULL) {
@@ -1874,7 +2787,7 @@ static void *find_machine_in_subtree(void *transform, void *qti, int depth)
     for (int32_t i = 0; i < count; i++) {
         void *idx_args[1] = {&i};
         void *child = inv(g_transform_get_child, transform, idx_args);
-        void *found = find_machine_in_subtree(child, qti, depth + 1);
+        void *found = find_machine_in_subtree(child, refs, depth + 1);
         if (found != NULL) {
             return found;
         }
@@ -1882,13 +2795,73 @@ static void *find_machine_in_subtree(void *transform, void *qti, int depth)
     return NULL;
 }
 
-/* Apop/Talk objectives: the friendly Monster carrying the wanted apopID.
+/* Map-wide machine search, mirroring MapNav.FindMachine: walks every cell in
+   Area.Cells (not just the current one) and returns the frame name of the
+   first one whose subtree holds a matching MapMachine. Needed for the same
+   reason find_hostile_frame is: find_machine_in_subtree only sees the
+   CURRENT cell, but a chain's fixed entry frame does not always hold the
+   objective's target - Lair's DragonSlayer armor pieces (quest 59, "DSPiece")
+   are scattered across several rooms, not the Enter cell chains park the
+   player in. Confirmed on device: without this, quest 59 just reported
+   "interact target not in current cell" forever. */
+static bool find_machine_frame(const RefTokens *refs, char *out_frame, size_t out_cap)
+{
+    out_frame[0] = '\0';
+    if (g_area_currentarea_field == NULL || g_area_cells_field == NULL ||
+        g_component_get_transform == NULL || !il2cpp_field_static_get_value) {
+        return false;
+    }
+    void *area = NULL;
+    il2cpp_field_static_get_value(g_area_currentarea_field, &area);
+    if (area == NULL) {
+        return false;
+    }
+    void *cells = NULL;
+    il2cpp_field_get_value(area, g_area_cells_field, &cells);
+    if (cells == NULL) {
+        return false;
+    }
+    void *cells_class = il2cpp_object_get_class(cells);
+    EnumWalk w;
+    if (!enum_open(cells, il2cpp_class_get_method_from_name(cells_class, "GetEnumerator", 0),
+                   &w)) {
+        return false;
+    }
+    for (int i = 0; i < 64 && inv_bool(w.move_next, w.self, NULL); i++) {
+        void *boxed_kv = inv(w.get_current, w.self, NULL);
+        void *kv_self = self_ptr(boxed_kv);
+        if (kv_self == NULL) {
+            continue;
+        }
+        void *kv_class = il2cpp_object_get_class(boxed_kv);
+        void *get_key = il2cpp_class_get_method_from_name(kv_class, "get_Key", 0);
+        void *get_value = il2cpp_class_get_method_from_name(kv_class, "get_Value", 0);
+        void *key = get_key ? inv(get_key, kv_self, NULL) : NULL;
+        void *cell = get_value ? inv(get_value, kv_self, NULL) : NULL;
+        if (key == NULL || cell == NULL) {
+            continue;
+        }
+        void *tr = inv(g_component_get_transform, cell, NULL);
+        if (find_machine_in_subtree(tr, refs, 0) != NULL) {
+            mstr_to_utf8(key, out_frame, out_cap);
+            return true;
+        }
+    }
+    return false;
+}
+
+/* Apop/Talk objectives: the friendly Monster carrying the wanted apopID (or,
+   when that is not usable, the wanted catalog ID) - mirrors
+   MapNav.FindNpc(wantApop, wantNpcId) taking both signals, not apopID alone.
    Reuses the exact Area.currentArea.Monsters walk find_nearest_hostile does
    (down to the field/method handles) - same generic Dictionary<int,Monster>
-   technique, filtering on apopID instead of reactionType==Hostile. */
-static void *find_apop_npc(int32_t want_apop)
+   technique, filtering on apopID/ID instead of reactionType==Hostile. */
+static void *find_apop_npc(int32_t want_apop, int32_t want_npc_id)
 {
-    if (want_apop <= 0 || g_area_currentarea_field == NULL || g_area_monsters_field == NULL ||
+    if (want_apop <= 0 && want_npc_id <= 0) {
+        return NULL;
+    }
+    if (g_area_currentarea_field == NULL || g_area_monsters_field == NULL ||
         g_entity_apopid_field == NULL || !il2cpp_field_static_get_value) {
         return NULL;
     }
@@ -1903,33 +2876,39 @@ static void *find_apop_npc(int32_t want_apop)
         return NULL;
     }
     void *dict_class = il2cpp_object_get_class(dict);
-    void *get_enumerator = il2cpp_class_get_method_from_name(dict_class, "GetEnumerator", 0);
-    void *boxed_enum = get_enumerator ? inv(get_enumerator, dict, NULL) : NULL;
-    void *enum_raw = boxed_enum ? il2cpp_object_unbox(boxed_enum) : NULL;
-    if (enum_raw == NULL) {
+    EnumWalk w;
+    if (!enum_open(dict, il2cpp_class_get_method_from_name(dict_class, "GetEnumerator", 0), &w)) {
         return NULL;
     }
-    void *enum_class = il2cpp_object_get_class(boxed_enum);
-    void *move_next = il2cpp_class_get_method_from_name(enum_class, "MoveNext", 0);
-    void *get_current = il2cpp_class_get_method_from_name(enum_class, "get_Current", 0);
-    if (move_next == NULL || get_current == NULL) {
-        return NULL;
-    }
-    for (int i = 0; i < 500 && inv_bool(move_next, enum_raw, NULL); i++) {
-        void *boxed_kv = inv(get_current, enum_raw, NULL);
-        void *kv_raw = boxed_kv ? il2cpp_object_unbox(boxed_kv) : NULL;
-        if (kv_raw == NULL) {
+    for (int i = 0; i < 500 && inv_bool(w.move_next, w.self, NULL); i++) {
+        void *boxed_kv = inv(w.get_current, w.self, NULL);
+        void *kv_self = self_ptr(boxed_kv);
+        if (kv_self == NULL) {
             continue;
         }
         void *kv_class = il2cpp_object_get_class(boxed_kv);
         void *get_value = il2cpp_class_get_method_from_name(kv_class, "get_Value", 0);
-        void *mon = get_value ? inv(get_value, kv_raw, NULL) : NULL;
+        void *mon = get_value ? inv(get_value, kv_self, NULL) : NULL;
         if (mon == NULL) {
             continue;
         }
+        /* Skip hostiles, as MapNav.FindNpc does: a quest giver is always
+           friendly/neutral, and apopID defaults to -1 on things that have
+           none, so an unset field can never collide with a real want_apop. */
+        if (g_monster_reaction_field != NULL) {
+            int32_t reaction = 0;
+            il2cpp_field_get_value(mon, g_monster_reaction_field, &reaction);
+            if (reaction == 1) {
+                continue;
+            }
+        }
         int32_t apop = -1;
         il2cpp_field_get_value(mon, g_entity_apopid_field, &apop);
-        if (apop == want_apop) {
+        if (want_apop > 0 && apop == want_apop) {
+            return mon;
+        }
+        if (want_npc_id > 0 && g_entity_get_id != NULL &&
+            inv_int(g_entity_get_id, mon, NULL) == want_npc_id) {
             return mon;
         }
     }
@@ -1966,27 +2945,20 @@ static void *next_incomplete_objective(void *quest, void *player, int32_t *qotyp
        incomplete Killcount objective as having nothing actionable - the bot
        fell back to blind hunting and only completed by luck (monsters
        happened to be in the starting room). Resolving GetEnumerator on
-       System.Array instead - the class that actually declares it - and
-       invoking on the array instance is the fix; everything past that point
-       (the returned enumerator's OWN concrete class, unboxed the same way
-       the Monsters dictionary walk already does) is unchanged. */
+       System.Array instead - the class that actually declares it - is half
+       the fix; the other half is NOT unboxing what it returns, since unlike
+       Dictionary's struct enumerator this one is a reference type. See
+       self_ptr for why that distinction was silent rather than fatal. */
     void *get_enumerator = g_system_array_class != NULL
                               ? il2cpp_class_get_method_from_name(g_system_array_class,
                                                                   "GetEnumerator", 0)
                               : NULL;
-    void *boxed_enum = get_enumerator ? inv(get_enumerator, turnins, NULL) : NULL;
-    void *enum_raw = boxed_enum ? il2cpp_object_unbox(boxed_enum) : NULL;
-    if (enum_raw == NULL) {
+    EnumWalk w;
+    if (!enum_open(turnins, get_enumerator, &w)) {
         return NULL;
     }
-    void *enum_class = il2cpp_object_get_class(boxed_enum);
-    void *move_next = il2cpp_class_get_method_from_name(enum_class, "MoveNext", 0);
-    void *get_current = il2cpp_class_get_method_from_name(enum_class, "get_Current", 0);
-    if (move_next == NULL || get_current == NULL) {
-        return NULL;
-    }
-    for (int i = 0; i < 32 && inv_bool(move_next, enum_raw, NULL); i++) {
-        void *item = inv(get_current, enum_raw, NULL);
+    for (int i = 0; i < 32 && inv_bool(w.move_next, w.self, NULL); i++) {
+        void *item = inv(w.get_current, w.self, NULL);
         if (item == NULL) {
             continue;
         }
@@ -2051,6 +3023,21 @@ static void quest_tick(void)
         return;
     }
     g_next_quest_tick = now + 1.0f;
+
+    /* Stall detection, mirroring CheckHuntTimeout/Fail: g_quest_last_activity_at
+       advances on every mKill and every confirmed QComp (see the hook_get_
+       response tracking), reset whenever the active quest changes or the run
+       (re)starts. No kills and no completion for 90s means something this
+       bot doesn't handle - a wrong zone, an unmapped mob, an objective type
+       with no dispatch - not a quest to keep grinding forever in silence. */
+    if (g_quest_last_activity_at > 0.0f &&
+        now - g_quest_last_activity_at > QUEST_HUNT_TIMEOUT_SEC) {
+        LOGE("quest: no kills or progress in %.0fs - stopping", QUEST_HUNT_TIMEOUT_SEC);
+        snprintf(g_quest_status, sizeof(g_quest_status), "STALLED: no progress in %.0fs - stopped",
+                QUEST_HUNT_TIMEOUT_SEC);
+        g_quest_running = 0;
+        return;
+    }
 
     void *player = g_get_main_player ? inv(g_get_main_player, NULL, NULL) : NULL;
     if (player == NULL) {
@@ -2139,6 +3126,33 @@ static void quest_tick(void)
             return;
         }
 
+        /* Resume support: don't blindly restart every chain at index 0. If
+           quest(s) at the front of the baked-in list are already turned in -
+           the player ran this chain before, whether through the bot or by
+           hand - skip forward to the first one that is not, mirroring
+           QuestRunner.TickAccept's isQuestComplete check. Cheap to run every
+           tick: once resumed past, the current index's quest is never
+           complete so the loop body runs zero times. */
+        if (g_player_quests_field != NULL && g_pqd_is_quest_complete != NULL) {
+            void *pq_resume = NULL;
+            il2cpp_field_get_value(player, g_player_quests_field, &pq_resume);
+            if (pq_resume != NULL) {
+                while (g_chain_index < chain->count) {
+                    int32_t check_qid = chain->ids[g_chain_index];
+                    void *check_args[1] = {&check_qid};
+                    if (!inv_bool(g_pqd_is_quest_complete, pq_resume, check_args)) {
+                        break;
+                    }
+                    g_chain_index++;
+                }
+                if (g_chain_index >= chain->count) {
+                    snprintf(g_quest_status, sizeof(g_quest_status), "%s complete!", chain->name);
+                    g_quest_running = 0;
+                    return;
+                }
+            }
+        }
+
         qid = chain->ids[g_chain_index];
         void *id_args[1] = {&qid};
         quest = g_quest_get != NULL ? inv(g_quest_get, NULL, id_args) : NULL;
@@ -2173,6 +3187,7 @@ static void quest_tick(void)
         g_quest_last_id = qid;
         g_quest_accept_sent = 0;
         g_quest_turnin_sent = 0;
+        g_quest_last_activity_at = now; /* fresh quest - don't inherit a stale stall clock */
         LOGI("quest: now working on quest %d", qid);
     }
     void *id_args[1] = {&qid};
@@ -2197,11 +3212,35 @@ static void quest_tick(void)
 
     bool ready = g_quest_is_ready_turnin != NULL &&
                 inv_bool(g_quest_is_ready_turnin, quest, NULL);
+    if (ready) {
+        g_hunt = 0;
+        g_autoskills = 0; /* mirrors QuestRunner's StopAutoskills() on nextObjective==null */
+        g_interact_approach_active = 0;
+    }
     if (!ready) {
         int32_t qotype = -1;
         void *obj = next_incomplete_objective(quest, player, &qotype);
         /* QuestObjectiveType, per the decomp: Turnin=0 Killcount=1 Interact=2
            Talk=3 Apop=4 Cutscene=5. */
+        /* Publish the objective for hunt_tick's target filter. Only a
+           Killcount objective carries monster refs worth filtering on; for
+           everything else this stays cleared so any incidental hunting is
+           unconstrained. */
+        g_hunt_obj = (obj != NULL && qotype == 1) ? obj : NULL;
+        g_hunt_qotype = qotype;
+        g_hunt_qid = qid;
+        /* Default off; only the Interact/Apop branches below turn this back
+           on. Without this reset, switching from an Interact/Apop objective
+           to a Killcount one (or to no objective at all) left hunt_tick
+           still walking toward a stale machine/NPC position from whatever
+           was last published, indefinitely. */
+        g_interact_approach_active = 0;
+
+        /* Clicking a machine or an NPC every single tick is both pointless
+           and the kind of request rate that trips live AE's spam detection -
+           the desktop agent spaces these out and so do we. */
+        bool may_click = now >= g_next_interact;
+
         if (obj == NULL) {
             /* Nothing we can see is incomplete, yet IsReadyForTurnin says
                not ready - most likely a Turnin-type item-count objective,
@@ -2212,38 +3251,218 @@ static void quest_tick(void)
                     "quest %d - no actionable objective visible, hunting", qid);
         } else if (qotype == 2) { /* Interact */
             g_hunt = 0;           /* a machine click needs the player still, not chasing a mob */
+            /* Mirrors QuestRunner: EnsureAutoskillsOn() only ever runs from
+               inside a live-hostile engage; every non-combat objective path
+               (this one included) calls StopAutoskills() instead. Android's
+               hunt_tick sets g_autoskills=1 the same way on engage, but
+               nothing turned it back off - since g_hunt=0 makes hunt_tick
+               return before ever reaching that logic, autoskills firing from
+               an earlier Killcount objective stayed stuck on with no target,
+               which is what "spamming skills" at the DragonSlayer armor
+               machines was: skills firing on a 0.6s cycle at nothing. */
+            g_autoskills = 0;
+            RefTokens machine_refs;
+            qti_ref_tokens(obj, &machine_refs);
             void *cell_tr = current_cell_transform(player);
-            void *machine = cell_tr ? find_machine_in_subtree(cell_tr, obj, 0) : NULL;
-            if (machine != NULL && g_mapmachine_interact != NULL) {
-                inv(g_mapmachine_interact, machine, NULL);
-                snprintf(g_quest_status, sizeof(g_quest_status),
-                        "quest %d - clicked machine for current objective", qid);
+            void *machine = cell_tr ? find_machine_in_subtree(cell_tr, &machine_refs, 0) : NULL;
+            float me_pos[3], mach_pos[3];
+            void *player_parent_i = path_player_parent(inv(g_entity_getgameobject, player, NULL));
+            bool have_pos = machine != NULL && read_local_pos(player, me_pos) &&
+                            component_local_in_player_frame(machine, player_parent_i, mach_pos);
+            if (have_pos) {
+                /* Publish for hunt_tick to actually walk toward at its own
+                   ~3Hz cadence - see hunt_tick's top for why this can't just
+                   be called directly from here. */
+                g_interact_approach_active = 1;
+                memcpy(g_interact_approach_target, mach_pos, sizeof(mach_pos));
+                g_interact_reach_dist_pub = INTERACT_REACH_DIST;
             } else {
+                g_interact_approach_active = 0;
+            }
+            if (machine != NULL && g_mapmachine_interact != NULL && have_pos && g_interact_ready) {
+                if (may_click) {
+                    inv(g_mapmachine_interact, machine, NULL);
+                    g_next_interact = now + 2.5f;
+                }
                 snprintf(g_quest_status, sizeof(g_quest_status),
-                        "quest %d - interact target not in current cell", qid);
+                        "quest %d - clicking machine for current objective", qid);
+            } else if (machine != NULL && have_pos) {
+                /* Found it, but not close enough yet - hunt_tick is already
+                   walking/pathing toward it between quest_tick's own ticks. */
+                snprintf(g_quest_status, sizeof(g_quest_status),
+                        "quest %d - approaching machine for current objective", qid);
+            } else {
+                /* Not in this cell - search the whole map (mirrors
+                   MapNav.FindMachine + GoToFrame) and jump to whichever cell
+                   actually holds it, same cross-cell travel as the Killcount
+                   hunt path above. */
+                char here[40] = "";
+                if (g_entity_frame_field != NULL) {
+                    void *fs = NULL;
+                    il2cpp_field_get_value(player, g_entity_frame_field, &fs);
+                    mstr_to_utf8(fs, here, sizeof(here));
+                }
+                char want_frame[40];
+                if (find_machine_frame(&machine_refs, want_frame, sizeof(want_frame)) &&
+                    strcasecmp(want_frame, here) != 0) {
+                    bool need_send = strcasecmp(g_hunt_nav_frame, want_frame) != 0 ||
+                                      (now - g_hunt_nav_sent_at > 8.0f); /* matches QuestRunner.NavResendSec */
+                    if (need_send && g_req_movecell_class != NULL &&
+                        g_req_movecell_ctor != NULL && il2cpp_object_new &&
+                        il2cpp_string_new && g_send_request != NULL) {
+                        void *req = il2cpp_object_new(g_req_movecell_class);
+                        if (req != NULL) {
+                            void *ctor_args[2] = {il2cpp_string_new(want_frame),
+                                                  il2cpp_string_new("Spawn")};
+                            inv(g_req_movecell_ctor, req, ctor_args);
+                            void *send_args[1] = {req};
+                            inv(g_send_request, g_aec_instance, send_args);
+                            LOGI("quest: interact target not in '%s' - moving to '%s'", here,
+                                 want_frame);
+                        }
+                        snprintf(g_hunt_nav_frame, sizeof(g_hunt_nav_frame), "%s", want_frame);
+                        g_hunt_nav_sent_at = now;
+                    }
+                    snprintf(g_quest_status, sizeof(g_quest_status),
+                            "quest %d - traveling to %s for interact target", qid, want_frame);
+                } else {
+                    snprintf(g_quest_status, sizeof(g_quest_status),
+                            "quest %d - interact target not found anywhere in map", qid);
+                }
             }
         } else if (qotype == 3 || qotype == 4) { /* Talk / Apop */
             g_hunt = 0;
+            g_autoskills = 0; /* see the Interact branch above */
             int32_t zero = 0;
             void *ref_args[1] = {&zero};
             int32_t want_apop = g_qti_getrefint_method != NULL
                                     ? inv_int(g_qti_getrefint_method, obj, ref_args)
                                     : -1;
-            void *npc = find_apop_npc(want_apop);
-            void *npc_go = npc ? inv(g_entity_getgameobject, npc, NULL) : NULL;
+            int32_t want_npc_id = -1;
+            if (g_quest_npcid_field != NULL) {
+                il2cpp_field_get_value(quest, g_quest_npcid_field, &want_npc_id);
+            }
+            void *npc = find_apop_npc(want_apop, want_npc_id);
+            /* find_apop_npc already scans the whole map (no frame filter),
+               but that only means it CAN locate an NPC in another cell - it
+               says nothing about whether NPCButton.Interact() works on one
+               that is not in the player's currently active cell. Same class
+               of bug as the Interact/Killcount cross-cell gaps: check the
+               NPC's own Frame and travel there first if it differs. */
+            char npc_frame[40] = "";
+            if (npc != NULL && g_entity_frame_field != NULL) {
+                void *fs = NULL;
+                il2cpp_field_get_value(npc, g_entity_frame_field, &fs);
+                mstr_to_utf8(fs, npc_frame, sizeof(npc_frame));
+            }
+            char here_apop[40] = "";
+            if (g_entity_frame_field != NULL) {
+                void *fs = NULL;
+                il2cpp_field_get_value(player, g_entity_frame_field, &fs);
+                mstr_to_utf8(fs, here_apop, sizeof(here_apop));
+            }
+            void *npc_go = (npc != NULL && (npc_frame[0] == '\0' ||
+                                            strcasecmp(npc_frame, here_apop) == 0))
+                              ? inv(g_entity_getgameobject, npc, NULL)
+                              : NULL;
             void *npcbtn = npc_go ? get_component(npc_go, g_npcbutton_type_obj) : NULL;
-            if (npcbtn != NULL && g_npcbutton_interact != NULL) {
-                inv(g_npcbutton_interact, npcbtn, NULL);
+            float me_pos_apop[3], npc_pos[3];
+            void *player_parent_a = path_player_parent(inv(g_entity_getgameobject, player, NULL));
+            bool have_apop_pos = npc_go != NULL && read_local_pos(player, me_pos_apop) &&
+                                 entity_local_in_player_frame(npc, player_parent_a, npc_pos);
+            if (have_apop_pos) {
+                g_interact_approach_active = 1;
+                memcpy(g_interact_approach_target, npc_pos, sizeof(npc_pos));
+                g_interact_reach_dist_pub = INTERACT_REACH_DIST;
+            } else {
+                g_interact_approach_active = 0;
+            }
+            if (npcbtn != NULL && g_npcbutton_interact != NULL && have_apop_pos &&
+                g_interact_ready) {
+                if (may_click) {
+                    inv(g_npcbutton_interact, npcbtn, NULL);
+                    /* Belt-and-suspenders, mirroring ClickNpc: the button
+                       click SHOULD credit the objective via ShowApop(), but
+                       sending the same request the click's own dialog flow
+                       would send is harmless if already credited and covers
+                       the click silently not landing. */
+                    if (want_apop > 0 && g_req_apopqo_class != NULL &&
+                        g_req_apopqo_ctor != NULL && il2cpp_object_new &&
+                        g_monster_get_monmapid != NULL && g_send_request != NULL) {
+                        int32_t mon_map_id = inv_int(g_monster_get_monmapid, npc, NULL);
+                        void *req = il2cpp_object_new(g_req_apopqo_class);
+                        if (req != NULL) {
+                            void *apopqo_args[2] = {&want_apop, &mon_map_id};
+                            inv(g_req_apopqo_ctor, req, apopqo_args);
+                            void *send_args[1] = {req};
+                            inv(g_send_request, g_aec_instance, send_args);
+                        }
+                    }
+                    g_next_interact = now + 2.5f;
+                }
                 snprintf(g_quest_status, sizeof(g_quest_status),
-                        "quest %d - talked to NPC (apop %d)", qid, want_apop);
+                        "quest %d - talking to NPC (apop %d)", qid, want_apop);
+            } else if (npcbtn != NULL && have_apop_pos) {
+                snprintf(g_quest_status, sizeof(g_quest_status),
+                        "quest %d - approaching NPC (apop %d)", qid, want_apop);
+            } else if (npc != NULL && npc_frame[0] != '\0' &&
+                       strcasecmp(npc_frame, here_apop) != 0) {
+                bool need_send = strcasecmp(g_hunt_nav_frame, npc_frame) != 0 ||
+                                  (now - g_hunt_nav_sent_at > 8.0f); /* matches QuestRunner.NavResendSec */
+                if (need_send && g_req_movecell_class != NULL && g_req_movecell_ctor != NULL &&
+                    il2cpp_object_new && il2cpp_string_new && g_send_request != NULL) {
+                    void *req = il2cpp_object_new(g_req_movecell_class);
+                    if (req != NULL) {
+                        void *ctor_args[2] = {il2cpp_string_new(npc_frame),
+                                              il2cpp_string_new("Spawn")};
+                        inv(g_req_movecell_ctor, req, ctor_args);
+                        void *send_args[1] = {req};
+                        inv(g_send_request, g_aec_instance, send_args);
+                        LOGI("quest: apop %d not in '%s' - moving to '%s'", want_apop, here_apop,
+                             npc_frame);
+                    }
+                    snprintf(g_hunt_nav_frame, sizeof(g_hunt_nav_frame), "%s", npc_frame);
+                    g_hunt_nav_sent_at = now;
+                }
+                snprintf(g_quest_status, sizeof(g_quest_status),
+                        "quest %d - traveling to %s for NPC (apop %d)", qid, npc_frame,
+                        want_apop);
             } else {
                 snprintf(g_quest_status, sizeof(g_quest_status),
                         "quest %d - apop %d not found in current map", qid, want_apop);
             }
-        } else if (qotype == 5) { /* Cutscene - not covered */
-            g_hunt = 1;
-            snprintf(g_quest_status, sizeof(g_quest_status),
-                    "quest %d - cutscene objective not supported, hunting meanwhile", qid);
+        } else if (qotype == 5) { /* Cutscene */
+            g_hunt = 0;
+            g_autoskills = 0; /* see the Interact branch above */
+            /* Ask the server for the cutscene directly rather than trying to
+               find and click whatever triggers it in-world. The desktop
+               agent does the same, and for the same reason: driving it from
+               the trigger reliably lands on a black screen. */
+            int32_t zero = 0;
+            void *ref_args[1] = {&zero};
+            int32_t csid = g_qti_getrefint_method != NULL
+                               ? inv_int(g_qti_getrefint_method, obj, ref_args)
+                               : -1;
+            if (csid > 0 && may_click && g_req_cutscene_class != NULL &&
+                g_req_cutscene_ctor != NULL && il2cpp_object_new) {
+                void *req = il2cpp_object_new(g_req_cutscene_class);
+                if (req != NULL) {
+                    void *cs_args[1] = {&csid};
+                    inv(g_req_cutscene_ctor, req, cs_args);
+                    void *send_args[1] = {req};
+                    inv(g_send_request, g_aec_instance, send_args);
+                    g_next_interact = now + 5.0f; /* cutscenes take a while to play out */
+                    LOGI("quest: sent RequestWatchCutscene(%d)", csid);
+                }
+            }
+            if (csid > 0) {
+                snprintf(g_quest_status, sizeof(g_quest_status),
+                        "quest %d - watching cutscene %d", qid, csid);
+            } else {
+                g_hunt = 1;
+                snprintf(g_quest_status, sizeof(g_quest_status),
+                        "quest %d - cutscene objective has no id, hunting meanwhile", qid);
+            }
         } else { /* Killcount, or unrecognized - hunting is always a safe default */
             g_hunt = 1;
             snprintf(g_quest_status, sizeof(g_quest_status), "hunting for quest %d", qid);
@@ -2251,38 +3470,122 @@ static void quest_tick(void)
         return;
     }
 
-    if (!g_quest_turnin_sent && g_req_turnin_class != NULL && g_req_turnin_ctor != NULL &&
-        il2cpp_object_new) {
-        void *req = il2cpp_object_new(g_req_turnin_class);
-        if (req != NULL) {
-            int32_t choice = -1;
-            void *turnin_args[2] = {&qid, &choice};
-            inv(g_req_turnin_ctor, req, turnin_args);
-            void *send_args[1] = {req};
-            inv(g_send_request, g_aec_instance, send_args);
-            g_quest_turnin_sent = 1;
-            LOGI("quest: sent RequestTryQuestComplete(%d, -1)", qid);
-            if (chain != NULL) {
-                /* Chain mode advances off our own baked-in list, not the
-                   live tracker - deterministic regardless of whether the
-                   client happens to auto-track the next storyline quest. */
-                g_chain_index++;
-                if (g_chain_index >= chain->count) {
-                    snprintf(g_quest_status, sizeof(g_quest_status), "%s complete!",
-                            chain->name);
-                } else {
-                    snprintf(g_quest_status, sizeof(g_quest_status),
-                            "%s - quest %d turned in (%d/%d)", chain->name, qid,
-                            g_chain_index + 1, chain->count);
+    /* Travel to the turn-in location first. Mirrors AtTurnInLocation/
+       TickTurnIn: firing tryQuestComplete from wherever hunting happened to
+       end works by luck when the hunt and turn-in frames coincide, and
+       silently fails (or reads as a location mismatch to live AE) when they
+       don't - quest 20 hunts in Enter but turns in at R3; quest 59 hunts at
+       R8 but turns in back at Enter. */
+    const QuestTurnin *tloc = quest_turnin_loc(qid);
+    if (tloc != NULL) {
+        char here_ti[40] = "";
+        if (g_entity_frame_field != NULL) {
+            void *fs = NULL;
+            il2cpp_field_get_value(player, g_entity_frame_field, &fs);
+            mstr_to_utf8(fs, here_ti, sizeof(here_ti));
+        }
+        if (strcasecmp(here_ti, tloc->frame) != 0) {
+            bool need_send = strcasecmp(g_hunt_nav_frame, tloc->frame) != 0 ||
+                              (now - g_hunt_nav_sent_at > 8.0f);
+            if (need_send && g_req_movecell_class != NULL && g_req_movecell_ctor != NULL &&
+                il2cpp_object_new && il2cpp_string_new && g_send_request != NULL) {
+                void *req = il2cpp_object_new(g_req_movecell_class);
+                if (req != NULL) {
+                    void *ctor_args[2] = {il2cpp_string_new(tloc->frame),
+                                          il2cpp_string_new(tloc->pad)};
+                    inv(g_req_movecell_ctor, req, ctor_args);
+                    void *send_args[1] = {req};
+                    inv(g_send_request, g_aec_instance, send_args);
+                    LOGI("quest: traveling to turn-in location '%s' for quest %d", tloc->frame,
+                         qid);
                 }
-            } else {
+                snprintf(g_hunt_nav_frame, sizeof(g_hunt_nav_frame), "%s", tloc->frame);
+                g_hunt_nav_sent_at = now;
+            }
+            snprintf(g_quest_status, sizeof(g_quest_status),
+                    "quest %d - traveling to %s to turn in", qid, tloc->frame);
+            return;
+        }
+    }
+
+    if (!g_quest_turnin_sent) {
+        if (g_req_turnin_class != NULL && g_req_turnin_ctor != NULL && il2cpp_object_new) {
+            void *req = il2cpp_object_new(g_req_turnin_class);
+            if (req != NULL) {
+                int32_t choice = -1;
+                void *turnin_args[2] = {&qid, &choice};
+                inv(g_req_turnin_ctor, req, turnin_args);
+                void *send_args[1] = {req};
+                inv(g_send_request, g_aec_instance, send_args);
+                g_quest_turnin_sent = 1;
+                g_quest_turnin_sent_at = now;
+                LOGI("quest: sent RequestTryQuestComplete(%d, -1)", qid);
                 snprintf(g_quest_status, sizeof(g_quest_status),
-                        "quest %d turned in - waiting for next tracked quest", qid);
-                /* Track mode stays on this ID until the tracker itself
-                   moves; the id-change check above resets accept/turnin
-                   state whenever that happens. */
+                        "quest %d - turn-in sent, awaiting confirmation", qid);
             }
         }
+        return;
+    }
+
+    /* Sent - do NOT advance the chain until the server actually confirms it
+       (QComp/Success), mirroring TickAwaitComplete. Advancing on send alone
+       let a dropped or rejected turn-in silently desync the chain index from
+       the server's real quest state - the run would think it had moved on
+       to the next quest while the server still considered the old one
+       active. */
+    if (g_qcomp_qid == qid && g_qcomp_at > g_quest_turnin_sent_at) {
+        LOGI("quest: turn-in confirmed (QComp success) for quest %d", qid);
+        if (chain != NULL) {
+            /* Chain mode advances off our own baked-in list, not the live
+               tracker - deterministic regardless of whether the client
+               happens to auto-track the next storyline quest. */
+            g_chain_index++;
+            if (g_chain_index >= chain->count) {
+                snprintf(g_quest_status, sizeof(g_quest_status), "%s complete!", chain->name);
+            } else {
+                snprintf(g_quest_status, sizeof(g_quest_status),
+                        "%s - quest %d turned in (%d/%d)", chain->name, qid, g_chain_index + 1,
+                        chain->count);
+            }
+        } else {
+            snprintf(g_quest_status, sizeof(g_quest_status),
+                    "quest %d turned in - waiting for next tracked quest", qid);
+            /* Track mode stays on this ID until the tracker itself moves;
+               the id-change check above resets accept/turnin state whenever
+               that happens. */
+        }
+        return;
+    }
+
+    /* No confirmation yet - check for an rNotify that arrived after our
+       send. "Spam Detected" is a rate limit, not a rejection: back off and
+       let the resend-after-timeout path below retry. Anything else is a
+       real rejection, and mirrors Fail() by stopping the run outright rather
+       than looping on a turn-in that will never succeed. */
+    if (g_notify_at > g_quest_turnin_sent_at && g_notify_msg[0] != '\0') {
+        char lower[128];
+        snprintf(lower, sizeof(lower), "%s", g_notify_msg);
+        for (char *p = lower; *p; p++) {
+            *p = (char)tolower((unsigned char)*p);
+        }
+        bool is_spam = strstr(lower, "spam") != NULL || strstr(lower, "wait before") != NULL;
+        if (!is_spam) {
+            g_quest_running = 0;
+            snprintf(g_quest_status, sizeof(g_quest_status), "quest %d - rejected: %s", qid,
+                    g_notify_msg);
+            LOGE("quest: turn-in for %d rejected by server: %s", qid, g_notify_msg);
+            return;
+        }
+        snprintf(g_quest_status, sizeof(g_quest_status), "quest %d - rate-limited, retrying", qid);
+    }
+
+    /* Resend once nothing has confirmed or rejected within a reasonable
+       window - the server does occasionally drop a request outright. */
+    if (now - g_quest_turnin_sent_at > 6.0f) {
+        g_quest_turnin_sent = 0;
+    } else {
+        snprintf(g_quest_status, sizeof(g_quest_status), "quest %d - awaiting turn-in confirmation",
+                qid);
     }
 }
 
@@ -2477,6 +3780,10 @@ static void hook_host_ongui(void *self, void *method)
         g_skill_slot = 0;
         g_next_skill = 0.0f;
     }
+    if (gui_button(272, 176, 130, 30,
+                   g_autoskip_cutscenes ? "Cutscene Skip: ON" : "Cutscene Skip: OFF")) {
+        g_autoskip_cutscenes = !g_autoskip_cutscenes;
+    }
 
     if (gui_button(18, 212, 90, 30, "Name")) {
         keyboard_open(KB_SPOOF);
@@ -2532,6 +3839,8 @@ static void hook_host_ongui(void *self, void *method)
         g_next_quest_tick = 0.0f;
         g_next_getquests_request = 0.0f;
         g_quest_last_id = 0;
+        g_quest_last_activity_at = g_time_get_time ? inv_float(g_time_get_time, NULL, NULL) : 0.0f;
+        g_interact_approach_active = 0;
         snprintf(g_quest_status, sizeof(g_quest_status), "%s",
                 g_quest_running ? "starting" : "stopped");
     }
@@ -2663,6 +3972,40 @@ static void *hook_register_slot(void *self, void *sb, void *method)
     return orig_register(self, sb, method);
 }
 
+/* Cutscene auto-skip, porting BeyondAgent.Patches.CutsceneSkipPatch: a
+   Harmony postfix on Dialogger_Manager.StartCutscene that calls EndPressed()
+   one frame later (deferred because StartCutscene kicks off async asset
+   loads that EndPressed's page-state check expects to exist yet). EndPressed
+   is the same call the in-game "End" button makes, so DoCompleteActions
+   still runs - quest hooks, item grants, whatever the cutscene's own
+   completeActions do - unlike just dropping the getDialog/getCutscene packet
+   outright, which would skip those too and silently stall progression.
+   There is no native inline-hook equivalent of "yield return null", so the
+   defer here is "consumed on the next AEC.Update tick" instead of exactly
+   one Unity frame - AEC.Update runs every frame anyway, so in practice this
+   is the same wait, just not frame-exact. */
+static void *hook_start_cutscene(void *self, void *method)
+{
+    void *r = orig_start_cutscene(self, method);
+    if (g_autoskip_cutscenes && self != NULL) {
+        g_pending_cutscene_mgr = self;
+    }
+    return r;
+}
+
+static void cutscene_skip_tick(void)
+{
+    if (g_pending_cutscene_mgr == NULL) {
+        return;
+    }
+    void *mgr = g_pending_cutscene_mgr;
+    g_pending_cutscene_mgr = NULL; /* consume before invoking - EndPressed must not re-trigger this */
+    if (g_dialogger_endpressed != NULL) {
+        inv(g_dialogger_endpressed, mgr, NULL);
+        LOGI("cutscene: auto-skipped");
+    }
+}
+
 /* Runs on Unity's main thread, from the AEC.Update hook. */
 static void setup_menu(void *domain,
                        il2cpp_domain_assembly_open_t assembly_open,
@@ -2773,6 +4116,9 @@ static void setup_menu(void *domain,
             g_quest_get_id = il2cpp_class_get_method_from_name(quest_class, "get_ID", 0);
             g_quest_is_ready_turnin =
                 il2cpp_class_get_method_from_name(quest_class, "IsReadyForTurnin", 0);
+            if (il2cpp_class_get_field_from_name) {
+                g_quest_npcid_field = il2cpp_class_get_field_from_name(quest_class, "NPCID");
+            }
         }
         if (tracker_class != NULL) {
             g_uiquesttracker_get_currentquest =
@@ -2786,12 +4132,20 @@ static void setup_menu(void *domain,
         g_req_turnin_ctor = find_method(g_req_turnin_class, ".ctor", 2, 0, NULL);
         g_req_transfer_class = class_from_name(g_cs_image, "", "RequestMoveToArea");
         g_req_transfer_ctor = find_method(g_req_transfer_class, ".ctor", 5, 0, NULL);
+        g_req_cutscene_class = class_from_name(g_cs_image, "", "RequestWatchCutscene");
+        g_req_cutscene_ctor = find_method(g_req_cutscene_class, ".ctor", 1, 0, NULL);
+        g_req_movecell_class = class_from_name(g_cs_image, "", "RequestMoveToCell");
+        g_req_movecell_ctor = find_method(g_req_movecell_class, ".ctor", 2, 0, NULL);
+        g_req_apopqo_class = class_from_name(g_cs_image, "", "RequestOpenApopQO");
+        g_req_apopqo_ctor = find_method(g_req_apopqo_class, ".ctor", 2, 0, NULL);
         LOGI("menu: quest Get=%p CurrentQuest=%p get_ID=%p IsReadyForTurnin=%p "
-             "IsQuestAccepted=%p Accept=%p/%p TurnIn=%p/%p Transfer=%p/%p",
+             "IsQuestAccepted=%p Accept=%p/%p TurnIn=%p/%p Transfer=%p/%p Cutscene=%p/%p "
+             "MoveCell=%p/%p",
              g_quest_get, g_uiquesttracker_get_currentquest, g_quest_get_id,
              g_quest_is_ready_turnin, g_player_is_quest_accepted, g_req_accept_class,
              g_req_accept_ctor, g_req_turnin_class, g_req_turnin_ctor, g_req_transfer_class,
-             g_req_transfer_ctor);
+             g_req_transfer_ctor, g_req_cutscene_class, g_req_cutscene_ctor,
+             g_req_movecell_class, g_req_movecell_ctor);
 
         /* Objective dispatch: Interact (machine click) and Apop/Talk (NPC
            click). See next_incomplete_objective()/find_machine_in_subtree()/
@@ -2822,6 +4176,7 @@ static void setup_menu(void *domain,
             g_qti_getrefint_method = il2cpp_class_get_method_from_name(qti_class, "GetRefInt", 1);
             g_qti_refscontains_method =
                 il2cpp_class_get_method_from_name(qti_class, "RefsContains", 1);
+            g_qti_refarray_field = il2cpp_class_get_field_from_name(qti_class, "RefArray");
         }
         if (player_class != NULL && il2cpp_class_get_field_from_name) {
             g_player_quests_field = il2cpp_class_get_field_from_name(player_class, "Quests");
@@ -2829,6 +4184,8 @@ static void setup_menu(void *domain,
         if (pqd_class != NULL) {
             g_pqd_is_objective_complete =
                 il2cpp_class_get_method_from_name(pqd_class, "IsObjectiveComplete", 1);
+            g_pqd_is_quest_complete =
+                il2cpp_class_get_method_from_name(pqd_class, "isQuestComplete", 1);
         }
         if (area_c != NULL) {
             if (il2cpp_class_get_field_from_name) {
@@ -2900,6 +4257,18 @@ static void setup_menu(void *domain,
              "pendingCooldown=%p cooldown=%p",
              g_get_slot, g_use_skill, reg, g_time_get_time, g_slotbtn_disabled_field,
              g_slotbtn_pendingcd_field, g_slotbtn_cooldown_field);
+
+        /* Cutscene auto-skip: hook StartCutscene, resolve EndPressed to fire
+           on the next tick. See hook_start_cutscene/cutscene_skip_tick. */
+        void *dialogger = class_from_name(g_cs_image, "", "Dialogger_Manager");
+        void *start_cs = find_method(dialogger, "StartCutscene", 0, 0, NULL);
+        void *start_cs_code = start_cs ? method_code_ptr(start_cs) : NULL;
+        if (start_cs_code != NULL) {
+            hook_func("Dialogger_Manager.StartCutscene", start_cs_code,
+                      (void *)hook_start_cutscene, (void **)&orig_start_cutscene);
+        }
+        g_dialogger_endpressed = find_method(dialogger, "EndPressed", 0, 0, NULL);
+        LOGI("menu: cutscene StartCutscene=%p EndPressed=%p", start_cs, g_dialogger_endpressed);
 
         /* Nameplate spoof: replace what Player.ComposeNameplateText returns. */
         void *player = class_from_name(g_cs_image, "", "Player");
@@ -3007,6 +4376,9 @@ static void setup_menu(void *domain,
         g_transform_transformpoint = find_method(transform_class, "TransformPoint", 1, 0, NULL);
         g_transform_get_lossyscale = find_method(transform_class, "get_lossyScale", 0, 0, NULL);
         g_transform_get_parent = find_method(transform_class, "get_parent", 0, 0, NULL);
+        g_transform_get_position = find_method(transform_class, "get_position", 0, 0, NULL);
+        g_transform_inversetransformpoint =
+            find_method(transform_class, "InverseTransformPoint", 1, 0, NULL);
 
         void *layermask_class = class_from_name(core_image, "UnityEngine", "LayerMask");
         void *name_to_layer = find_method(layermask_class, "NameToLayer", 1, 0, "String");
@@ -3136,11 +4508,16 @@ static void probe_monsters(void)
            field - empty string, no exception, no hint anything is wrong. So
            resolve on Monster's own class, where the override actually lives. */
         g_entity_get_name = il2cpp_class_get_method_from_name(monster_class, "get_Name", 0);
+        g_monster_get_monmapid = il2cpp_class_get_method_from_name(monster_class, "get_monMapID", 0);
         /* currentState is NOT overridden by Monster (only Name is, per the
            decomp), so resolving it on Entity is safe here - unlike get_Name
            above, there's no derived-class override to miss. */
         g_entity_get_currentstate =
             il2cpp_class_get_method_from_name(entity_class, "get_currentState", 0);
+        /* Same reasoning as currentState: ID is virtual on Entity but only
+           Player overrides it, so Entity's is the one a Monster actually
+           runs. This is the MonID that Killcount RefArray entries name. */
+        g_entity_get_id = il2cpp_class_get_method_from_name(entity_class, "get_ID", 0);
         LOGI("monster probe: currentArea field=%p Monsters field=%p reactionType field=%p "
              "get_Name=%p get_currentState=%p",
              g_area_currentarea_field, g_area_monsters_field, g_monster_reaction_field,
@@ -3226,6 +4603,7 @@ static void *hook_aec_update(void *a0, void *a1)
     g_aec_instance = a0; /* AEC.Update is an instance method: a0 is the AEC */
     autoskills_tick();
     spoof_tick();
+    cutscene_skip_tick();
     quest_tick(); /* may turn hunting on - runs before hunt_tick so this tick sees it */
     hunt_tick();
     probe_monsters();
@@ -3296,6 +4674,8 @@ static void *beyond_thread(void *arg)
     il2cpp_type_get_name = (il2cpp_type_get_name_t)dlsym(lib, "il2cpp_type_get_name");
     il2cpp_free = (il2cpp_free_t)dlsym(lib, "il2cpp_free");
     il2cpp_object_unbox = (il2cpp_object_unbox_t)dlsym(lib, "il2cpp_object_unbox");
+    il2cpp_class_is_valuetype =
+        (il2cpp_class_is_valuetype_t)dlsym(lib, "il2cpp_class_is_valuetype");
     il2cpp_gchandle_new = (il2cpp_gchandle_new_t)dlsym(lib, "il2cpp_gchandle_new");
     il2cpp_gchandle_get_target =
         (il2cpp_gchandle_get_target_t)dlsym(lib, "il2cpp_gchandle_get_target");
