@@ -1533,7 +1533,8 @@ namespace BeyondAgent.Util
         // carries its .Frame — including those in cells we haven't loaded — so
         // this is a pure lookup, no walking. Returns the current frame if a
         // match is already here, else the most-populated matching frame, else
-        // "" when nothing in the whole map matches.
+        // the frame of a dead match awaiting respawn, else "" when nothing in
+        // the whole map matches.
         private string FindHostileFrame(QuestTurninItem obj)
         {
             if (Area.currentArea?.Monsters == null)
@@ -1543,13 +1544,13 @@ namespace BeyondAgent.Util
 
             string here = Entity.mainPlayer?.Frame ?? "";
             Dictionary<string, int> byFrame = new(StringComparer.OrdinalIgnoreCase);
+            string respawnFrame = "";
             try
             {
                 foreach (Monster m in Area.currentArea.Monsters.Values)
                 {
                     if (m == null
                         || m.reactionType != Entity.ReactionType.Hostile
-                        || m.currentState == Entity.State.Dead
                         || !MatchesTarget(m, obj))
                     {
                         continue;
@@ -1557,6 +1558,18 @@ namespace BeyondAgent.Util
                     string f = m.Frame ?? "";
                     if (string.IsNullOrEmpty(f))
                     {
+                        continue;
+                    }
+                    // A dead match respawns where it stood. Remember one
+                    // (ours first) so killing a lone boss — aranx's Infinity
+                    // Manticore, the Dragonoid — waits for it instead of
+                    // sweeping every cell and failing before it's back.
+                    if (m.currentState == Entity.State.Dead)
+                    {
+                        if (respawnFrame.Length == 0 || string.Equals(f, here, StringComparison.OrdinalIgnoreCase))
+                        {
+                            respawnFrame = f;
+                        }
                         continue;
                     }
                     if (string.Equals(f, here, StringComparison.OrdinalIgnoreCase))
@@ -1567,7 +1580,7 @@ namespace BeyondAgent.Util
                 }
             }
             catch { }
-            return byFrame.Count == 0 ? ""
+            return byFrame.Count == 0 ? respawnFrame
                 : byFrame.OrderByDescending(kv => kv.Value).First().Key;
         }
 
@@ -1641,7 +1654,124 @@ namespace BeyondAgent.Util
         // A mob matching EITHER counts. Only when NO signal exists at all do we
         // fall back to "any hostile" (so an unmapped collect objective still
         // grinds the room and lets the server credit whatever it credits).
+        // ObjectiveFocus narrows that union to the objective's own monsters
+        // when it can tell which those are.
         private bool MatchesTarget(Monster m, QuestTurninItem obj)
+        {
+            HashSet<int> focus = ObjectiveFocus(obj);
+            return focus != null ? focus.Contains(m.ID) : MatchesAnySignal(m, obj);
+        }
+
+        // The entry's `mon` list covers the whole quest, so on a quest with
+        // two kill objectives the union keeps farming whichever mob shares
+        // our cell long after its own objective is done, and never walks to
+        // the other one's cell (aranx: Infinity Manticore in R4, Earth
+        // Elementals in R2/R3). Narrow it per objective, most specific first:
+        //   1. the objective's own RefArray MonIDs, when any are on this map;
+        //   2. among monsters the entry's `mon` hint already accepts, those
+        //      whose name best matches the objective's ("Space Zards" →
+        //      Space Zard, "Wyvern pacified" → Wyvern).
+        // null = no narrowing; use the union. Memoized per frame since
+        // MatchesTarget runs once per monster per tick.
+        private HashSet<int> ObjectiveFocus(QuestTurninItem obj)
+        {
+            if (obj == null || obj.QOType != QuestObjectiveType.Killcount)
+            {
+                return null;
+            }
+            if (_focusAt != Time.frameCount || _focusQoid != obj.QOID)
+            {
+                _focusAt = Time.frameCount;
+                _focusQoid = obj.QOID;
+                _focus = ResolveFocus(obj);
+            }
+            return _focus;
+        }
+
+        private HashSet<int> ResolveFocus(QuestTurninItem obj)
+        {
+            if (Area.currentArea?.Monsters == null)
+            {
+                return null;
+            }
+
+            HashSet<int> refs = [];
+            foreach (string r in obj.RefArray ?? [])
+            {
+                if (int.TryParse(r, out int id))
+                {
+                    refs.Add(id);
+                }
+            }
+
+            // Best name score per hostile MonID the union accepts. One MonID
+            // can carry several display names (asteroid's "Stamper" is a
+            // Space Sneevil), so keep the best.
+            HashSet<string> want = NameWords(obj.Name);
+            Dictionary<int, int> scores = [];
+            bool refsHere = false;
+            try
+            {
+                foreach (Monster m in Area.currentArea.Monsters.Values)
+                {
+                    if (m == null || m.reactionType != Entity.ReactionType.Hostile)
+                    {
+                        continue;
+                    }
+                    refsHere |= refs.Contains(m.ID);
+                    if (TargetMons.Count == 0 || !MatchesAnySignal(m, obj))
+                    {
+                        continue;
+                    }
+                    int score = NameWords(m.Name).Count(want.Contains);
+                    scores[m.ID] = scores.TryGetValue(m.ID, out int prev) ? Math.Max(prev, score) : score;
+                }
+            }
+            catch { }
+
+            if (refsHere)
+            {
+                return refs;
+            }
+            // Name matching only narrows an explicit `mon` hint (scores is
+            // empty without one): with no hint, "any hostile" stays the rule
+            // rather than a guess from names alone.
+            int best = scores.Count == 0 ? 0 : scores.Values.Max();
+            if (best == 0 || scores.Values.All(s => s == best))
+            {
+                return null;   // names don't tell the candidates apart
+            }
+            return [.. scores.Where(kv => kv.Value == best).Select(kv => kv.Key)];
+        }
+
+        // Lower-case words of 3+ letters with a plural/possessive "s"
+        // dropped, so "Zardman's Fish" and "Space Zards" line up with
+        // "Zardman Fisherman" and "Space Zard".
+        private static HashSet<string> NameWords(string name)
+        {
+            name ??= "";
+            if (!_nameWords.TryGetValue(name, out HashSet<string> words))
+            {
+                words = [];
+                foreach (string raw in System.Text.RegularExpressions.Regex.Split(name.ToLowerInvariant(), "[^a-z]+"))
+                {
+                    string w = raw.Length > 3 && raw.EndsWith("s") ? raw[..^1] : raw;
+                    if (w.Length >= 3)
+                    {
+                        words.Add(w);
+                    }
+                }
+                _nameWords[name] = words;
+            }
+            return words;
+        }
+
+        private static readonly Dictionary<string, HashSet<string>> _nameWords = [];
+        private HashSet<int> _focus;
+        private int _focusAt = -1;
+        private int _focusQoid = -1;
+
+        private bool MatchesAnySignal(Monster m, QuestTurninItem obj)
         {
             bool hasSignal = false;
 
