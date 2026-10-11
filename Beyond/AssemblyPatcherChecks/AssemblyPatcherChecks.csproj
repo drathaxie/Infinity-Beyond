@@ -8,5 +8,8 @@
   <ItemGroup>
     <Compile Include="..\Launcher\AssemblyPatcher.cs" Link="AssemblyPatcher.cs" />
     <PackageReference Include="Mono.Cecil" Version="0.11.6" />
+    <!-- A clean install has no BeyondAgent.dll in Managed; the runner falls
+         back to the build's copy placed beside it. -->
+    <None Include="..\build\BeyondAgent.dll" Link="BeyondAgent.dll" CopyToOutputDirectory="PreserveNewest" Visible="false" Condition="Exists('..\build\BeyondAgent.dll')" />
   </ItemGroup>
 </Project>
