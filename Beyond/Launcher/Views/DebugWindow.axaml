@@ -1,0 +1,101 @@
+<Window xmlns="https://github.com/avaloniaui"
+        xmlns:x="http://schemas.microsoft.com/winfx/2006/xaml"
+        xmlns:vm="using:Launcher.ViewModels"
+        xmlns:v="using:Launcher.Views"
+        x:Class="Launcher.Views.DebugWindow"
+        x:DataType="vm:MainWindowViewModel"
+        Title="Debug Tools"
+        Background="#0F0F11"
+        FontFamily="Inter, Segoe UI, sans-serif"
+        WindowStartupLocation="CenterOwner"
+        ExtendClientAreaToDecorationsHint="True"
+        ExtendClientAreaTitleBarHeightHint="30"
+        WindowDecorations="BorderOnly"
+        CanResize="False"
+        Width="340" Height="625">
+
+    <DockPanel Classes="WindowRoot" LastChildFill="True">
+        <v:TitleBar DockPanel.Dock="Top" Title="Debug Tools"/>
+
+        <StackPanel Spacing="12" Margin="15">
+            <!-- Hitbox overlay toggle -->
+            <Border Background="#1C1D24" BorderBrush="#2A2A32" BorderThickness="1" CornerRadius="8" Padding="12">
+                <StackPanel Spacing="8">
+                    <TextBlock Text="Visual Hitboxes" Classes="Header" Margin="0"/>
+                    <TextBlock Text="Draws the collision geometry the game actually queries — the player's feet anchor, its blocker probes and every Blocker collider on screen."
+                               FontSize="11" Foreground="#8F909A" TextWrapping="Wrap" LineHeight="15"/>
+
+                    <ToggleButton Name="HitboxToggle" IsChecked="{Binding HitboxOverlayActive}"
+                                  HorizontalAlignment="Stretch" Height="42" FontSize="13" FontWeight="Bold">
+                        <Panel>
+                            <TextBlock Text="HITBOXES ON" IsVisible="{Binding #HitboxToggle.IsChecked}"
+                                       VerticalAlignment="Center" HorizontalAlignment="Center"/>
+                            <TextBlock Text="SHOW HITBOXES" IsVisible="{Binding !#HitboxToggle.IsChecked}"
+                                       VerticalAlignment="Center" HorizontalAlignment="Center"/>
+                        </Panel>
+                    </ToggleButton>
+
+                    <Grid ColumnDefinitions="*,Auto" Margin="0,4,0,0">
+                        <StackPanel Grid.Column="0" VerticalAlignment="Center">
+                            <TextBlock Text="Expand readout" FontSize="12" Foreground="#E2E4E9"/>
+                            <TextBlock Text="Collapsed to a single line by default. Hotkey: H"
+                                       FontSize="10" Foreground="#656770"/>
+                        </StackPanel>
+                        <ToggleSwitch Grid.Column="1" IsChecked="{Binding HitboxReadoutExpanded}"/>
+                    </Grid>
+
+                    <TextBlock Text="Overlay is drawn inside the game window. Requires a connected session."
+                               FontSize="10" Foreground="#656770" TextWrapping="Wrap"/>
+                </StackPanel>
+            </Border>
+
+            <!-- Legend -->
+            <Border Background="#1C1D24" BorderBrush="#2A2A32" BorderThickness="1" CornerRadius="8" Padding="12">
+                <StackPanel Spacing="7">
+                    <TextBlock Text="Legend" Classes="Header" Margin="0"/>
+
+                    <Grid ColumnDefinitions="14,*" ColumnSpacing="8">
+                        <Ellipse Width="10" Height="10" Fill="#FFEB33" VerticalAlignment="Center"/>
+                        <TextBlock Grid.Column="1" Text="Feet anchor — the point every blocker test starts from"
+                                   FontSize="11" Foreground="#C5C7D0" TextWrapping="Wrap"/>
+                    </Grid>
+                    <Grid ColumnDefinitions="14,*" ColumnSpacing="8">
+                        <Ellipse Width="10" Height="10" Fill="#8099FF" VerticalAlignment="Center"/>
+                        <TextBlock Grid.Column="1" Text="Player collider — the real hitbox; this is what the floor stops"
+                                   FontSize="11" Foreground="#C5C7D0" TextWrapping="Wrap"/>
+                    </Grid>
+                    <Grid ColumnDefinitions="14,*" ColumnSpacing="8">
+                        <Ellipse Width="10" Height="10" Fill="#FF731F" VerticalAlignment="Center"/>
+                        <TextBlock Grid.Column="1" Text="Blocker colliders — the floor and walls themselves"
+                                   FontSize="11" Foreground="#C5C7D0" TextWrapping="Wrap"/>
+                    </Grid>
+                    <Grid ColumnDefinitions="14,*" ColumnSpacing="8">
+                        <Ellipse Width="10" Height="10" Fill="#8C8C9E" VerticalAlignment="Center"/>
+                        <TextBlock Grid.Column="1" Text="Faint — visible to raycasts but cannot block (trigger, or layer pair ignored)"
+                                   FontSize="11" Foreground="#C5C7D0" TextWrapping="Wrap"/>
+                    </Grid>
+                    <Grid ColumnDefinitions="14,*" ColumnSpacing="8">
+                        <Ellipse Width="10" Height="10" Fill="#40D9FF" VerticalAlignment="Center"/>
+                        <TextBlock Grid.Column="1" Text="Probe box — the ±1.00 × ±0.25 un-stick raycasts; secondary to collision, and only live on rigs with a Walk component (panel says which)"
+                                   FontSize="11" Foreground="#C5C7D0" TextWrapping="Wrap"/>
+                    </Grid>
+                    <Grid ColumnDefinitions="14,*" ColumnSpacing="8">
+                        <Ellipse Width="10" Height="10" Fill="#59FF73" VerticalAlignment="Center"/>
+                        <TextBlock Grid.Column="1" Text="Probe clear — nothing blocking that side"
+                                   FontSize="11" Foreground="#C5C7D0" TextWrapping="Wrap"/>
+                    </Grid>
+                    <Grid ColumnDefinitions="14,*" ColumnSpacing="8">
+                        <Ellipse Width="10" Height="10" Fill="#FF4747" VerticalAlignment="Center"/>
+                        <TextBlock Grid.Column="1" Text="Probe blocked — the square marks the exact contact point"
+                                   FontSize="11" Foreground="#C5C7D0" TextWrapping="Wrap"/>
+                    </Grid>
+                    <Grid ColumnDefinitions="14,*" ColumnSpacing="8">
+                        <Ellipse Width="10" Height="10" Fill="#BF80FF" VerticalAlignment="Center"/>
+                        <TextBlock Grid.Column="1" Text="Walk clearance — radius the quest runner paths around"
+                                   FontSize="11" Foreground="#C5C7D0" TextWrapping="Wrap"/>
+                    </Grid>
+                </StackPanel>
+            </Border>
+        </StackPanel>
+    </DockPanel>
+</Window>

@@ -33,6 +33,152 @@ namespace Launcher
             }
 
             StartUnityProcessDeferred(width, height);
+
+            // macOS has no HWND reparenting, so instead of hosting the game in a
+            // child window we let it stay a top-level window and continuously push
+            // this panel's on-screen rect to the agent, which glues the game's own
+            // NSWindow over it. See MacEmbed on the agent side.
+            if (RuntimeInformation.IsOSPlatform(OSPlatform.OSX) && _macFollowTimer == null)
+            {
+                _macFollowTimer = new DispatcherTimer { Interval = TimeSpan.FromMilliseconds(100) };
+                _macFollowTimer.Tick += (s, e) => PushMacGeometry();
+                _macFollowTimer.Start();
+            }
+        }
+
+        // --- macOS overlay-follow embedding ---------------------------------------
+        // Raised (macOS only) whenever the host panel's screen rect or visibility
+        // changes. Carries an AppKit frame: (x, y) is the bottom-left origin in
+        // points, (w, h) the size in points, and visible whether this tab is shown.
+        // SessionView forwards it to the owning view-model, which sends it over the
+        // agent pipe.
+        public event Action<double, double, double, double, bool>? EmbedGeometryChanged;
+
+        private DispatcherTimer? _macFollowTimer;
+        private double _macLastX, _macLastY, _macLastW, _macLastH;
+        private bool _macLastVisible;
+        private bool _macSentOnce;
+        private int _macTicksSinceSend;
+        private bool _macLoggedRaw;
+
+        // ~1s at the 100ms follow cadence. We re-push the current geometry this
+        // often even when nothing changed: the first on-change send fires ~100ms
+        // after load, but the agent's pipe isn't connected until a few seconds
+        // later, so that send is silently dropped (SendCommand no-ops with no
+        // active connection). With a stable panel rect nothing would ever change
+        // again, so without this heartbeat the agent would never receive geometry
+        // and the game window would float free instead of embedding.
+        private const int MacResendEveryTicks = 10;
+
+        private void PushMacGeometry()
+        {
+            if (TopLevel.GetTopLevel(this) is not Window top || VisualRoot == null)
+            {
+                return;
+            }
+
+            bool visible = IsEffectivelyVisible && top.WindowState != WindowState.Minimized;
+
+            double w = Bounds.Width;
+            double h = Bounds.Height;
+            double x = _macLastX;
+            double y = _macLastY;
+
+            if (visible && w > 0 && h > 0)
+            {
+                try
+                {
+                    // Convert this panel's on-screen rect to an AppKit frame:
+                    // points, bottom-left origin relative to the primary screen.
+                    //
+                    // PointToScreen and Screen.Bounds are reported in the same
+                    // coordinate unit as each other, so we divide BOTH by the
+                    // screen's own scaling to land in AppKit points. Do NOT use the
+                    // window's RenderScaling here: on macOS that's the Retina
+                    // backing-store factor (2), not the screen coordinate scale
+                    // (which the backend reports as Screen.Scaling — 1 for a
+                    // "looks-like 1710x1112" display). Mixing the two divides the
+                    // position by 2 while leaving the screen height unscaled, which
+                    // lands the window at half its real offset.
+                    PixelPoint topLeft = this.PointToScreen(new Point(0, 0));
+
+                    Screen? primary = top.Screens?.Primary;
+                    double screenScale = primary != null && primary.Scaling > 0 ? primary.Scaling : 1.0;
+                    double xPts = topLeft.X / screenScale;
+                    double yTopPts = topLeft.Y / screenScale;
+                    double primaryHeightPts = primary != null
+                        ? primary.Bounds.Height / screenScale
+                        : yTopPts + h;
+
+                    x = xPts;
+                    y = primaryHeightPts - (yTopPts + h);
+
+                    // One-shot dump of the raw inputs so a "window lands in the
+                    // wrong spot" bug is diagnosable from launch_debug.log without
+                    // guessing whether PointToScreen is px or pts, etc.
+                    if (!_macLoggedRaw)
+                    {
+                        _macLoggedRaw = true;
+                        PixelPoint winPos = top.Position;
+                        Screen? host = top.Screens?.ScreenFromVisual(this);
+                        DebugLog(
+                            $"[MacGeom] topLeft=({topLeft.X},{topLeft.Y}) renderScaling={top.RenderScaling} screenScale={screenScale} " +
+                            $"winPos=({winPos.X},{winPos.Y}) winClientSize=({top.ClientSize.Width}x{top.ClientSize.Height}) " +
+                            $"panelWH=({w}x{h}) " +
+                            $"primaryBounds=({primary?.Bounds.X},{primary?.Bounds.Y},{primary?.Bounds.Width},{primary?.Bounds.Height}) " +
+                            $"primaryScaling={primary?.Scaling} primaryHeightPts={primaryHeightPts} " +
+                            $"hostScreen=({host?.Bounds.X},{host?.Bounds.Y},{host?.Bounds.Width},{host?.Bounds.Height}) hostScaling={host?.Scaling} " +
+                            $"=> sent x={x:0.#} y={y:0.#}");
+                    }
+                }
+                catch (Exception ex)
+                {
+                    DebugLog($"[MacGeom] failed to compute geometry: {ex.Message}");
+                    return; // not laid out yet; try again next tick
+                }
+            }
+
+            _macTicksSinceSend++;
+            const double eps = 0.5;
+            bool changed = !_macSentOnce
+                || visible != _macLastVisible
+                || Math.Abs(x - _macLastX) > eps
+                || Math.Abs(y - _macLastY) > eps
+                || Math.Abs(w - _macLastW) > eps
+                || Math.Abs(h - _macLastH) > eps;
+            // Send on change for immediacy, and on the heartbeat interval so a send
+            // dropped while the agent pipe was still connecting is recovered.
+            if (!changed && _macTicksSinceSend < MacResendEveryTicks)
+            {
+                return;
+            }
+
+            _macLastX = x;
+            _macLastY = y;
+            _macLastW = w;
+            _macLastH = h;
+            _macLastVisible = visible;
+            _macSentOnce = true;
+            _macTicksSinceSend = 0;
+            EmbedGeometryChanged?.Invoke(x, y, w, h, visible);
+        }
+
+        // Append a line to the launcher's launch_debug.log (same file
+        // StartUnityProcessDeferred writes). Best-effort; never throws.
+        private static void DebugLog(string msg)
+        {
+            try
+            {
+                string logPath = Path.Combine(AppDomain.CurrentDomain.BaseDirectory, "UserData", "launch_debug.log");
+                string dir = Path.GetDirectoryName(logPath)!;
+                if (!Directory.Exists(dir))
+                {
+                    Directory.CreateDirectory(dir);
+                }
+
+                File.AppendAllText(logPath, $"[{DateTime.Now:HH:mm:ss}] {msg}\n");
+            }
+            catch { }
         }
 
         [DllImport("user32.dll", SetLastError = true, CharSet = CharSet.Unicode)]
@@ -215,6 +361,8 @@ namespace Launcher
         private DispatcherTimer? _resizeTimer;
         private int _lastWidth = -1;
         private int _lastHeight = -1;
+        private bool _gameSynced;
+        private bool _pendingGameResize;
 
         // Cross-process keyboard routing: the embedded game window lives on its
         // own thread, so the launcher UI thread's input queue must be attached
@@ -329,7 +477,14 @@ namespace Launcher
 
         private void StartUnityProcessDeferred(int width, int height)
         {
-            if (_childHwnd == IntPtr.Zero || _processStarted)
+            // On Windows we require the host child HWND (the game re-parents into
+            // it). On macOS there is no cross-process window embedding, so the game
+            // launches as its own top-level window — everything else (Cecil patch,
+            // named pipe, tool windows) works the same.
+            // ponytail: mac runs the game un-embedded; true in-tab embedding is the
+            // deferred window-model decision — layer it here when settled.
+            bool isWindows = RuntimeInformation.IsOSPlatform(OSPlatform.Windows);
+            if ((isWindows && _childHwnd == IntPtr.Zero) || _processStarted)
             {
                 return;
             }
@@ -371,38 +526,15 @@ namespace Launcher
                     {
                         try
                         {
-                            // Copy BeyondAgent.dll and 0Harmony.dll from launcher directory to game's managed directory
-                            string launcherDir = AppDomain.CurrentDomain.BaseDirectory;
-                            string sourceAgent = Path.Combine(launcherDir, "BeyondAgent.dll");
-                            string sourceHarmony = Path.Combine(launcherDir, "0Harmony.dll");
-
-                            if (File.Exists(sourceAgent))
-                            {
-                                string destAgent = Path.Combine(managedDir, "BeyondAgent.dll");
-                                File.Copy(sourceAgent, destAgent, true);
-                                Trace.WriteLine($"[Launcher] Copied BeyondAgent.dll to {destAgent}");
-                            }
-                            else
-                            {
-                                Trace.WriteLine($"[Launcher] Warning: BeyondAgent.dll not found in launcher directory: {sourceAgent}");
-                            }
-
-                            if (File.Exists(sourceHarmony))
-                            {
-                                string destHarmony = Path.Combine(managedDir, "0Harmony.dll");
-                                File.Copy(sourceHarmony, destHarmony, true);
-                                Trace.WriteLine($"[Launcher] Copied 0Harmony.dll to {destHarmony}");
-                            }
-                            else
-                            {
-                                Trace.WriteLine($"[Launcher] Warning: 0Harmony.dll not found in launcher directory: {sourceHarmony}");
-                            }
+                            AgentDeployment.Install(AppDomain.CurrentDomain.BaseDirectory,
+                                gameDir ?? Path.GetDirectoryName(gameExe)!, managedDir);
 
                             AssemblyPatcher.Patch(managedDir);
                         }
                         catch (Exception ex)
                         {
-                            Trace.WriteLine($"[AssemblyPatcher] Failed to patch Assembly-CSharp.dll: {ex}");
+                            Trace.WriteLine($"[AssemblyPatcher] Failed to prepare game agent: {ex}");
+                            throw;
                         }
                     }
                     else
@@ -410,11 +542,8 @@ namespace Launcher
                         Trace.WriteLine("MelonLoader detected. Disabling built-in modifications (restoring original assembly if needed).");
                         try
                         {
-                            string assemblyPath = Path.Combine(managedDir, "Assembly-CSharp.dll");
-                            string backupPath = assemblyPath + ".bak";
-                            if (File.Exists(backupPath))
+                            if (AssemblyPatcher.Restore(managedDir))
                             {
-                                File.Copy(backupPath, assemblyPath, true);
                                 Trace.WriteLine("Restored original Assembly-CSharp.dll from backup.");
                             }
                         }
@@ -424,16 +553,24 @@ namespace Launcher
                         }
                     }
 
+                    // -parentHWND is a Windows-only Unity arg; only pass it when we
+                    // actually have a host window to embed into.
+                    string embedArg = isWindows && _childHwnd != IntPtr.Zero ? $"-parentHWND {(long)_childHwnd} " : "";
                     ProcessStartInfo psi = new()
                     {
                         FileName = gameExe,
-                        Arguments = $"-parentHWND {(long)_childHwnd} -screen-width {width} -screen-height {height}",
+                        Arguments = $"{embedArg}-screen-width {width} -screen-height {height}",
                         WorkingDirectory = Path.GetDirectoryName(gameExe),
                         UseShellExecute = false
                     };
                     // Tell the agent which named pipe to serve for this session.
                     string pipeName = string.IsNullOrWhiteSpace(PipeName) ? "BeyondAgent" : PipeName;
                     psi.Environment[EnvPipeName] = pipeName;
+                    psi.Environment["BEYOND_BOTS"] = BotStorage.Prepare(gameDir);
+                    // macOS overlay-follow: the agent floats the game window above
+                    // the launcher, so it needs the launcher's pid to know when to
+                    // hide (frontmost app is neither the game nor us).
+                    psi.Environment["BEYOND_LAUNCHER_PID"] = Environment.ProcessId.ToString();
                     if (!string.IsNullOrEmpty(PresetUsername))
                     {
                         psi.Environment["BEYOND_USER"] = PresetUsername;
@@ -483,41 +620,71 @@ namespace Launcher
 
         private void ResizeUnityWindow()
         {
-            if (_childHwnd != IntPtr.Zero)
+            if (_childHwnd == IntPtr.Zero)
             {
-                int w = (int)Bounds.Width;
-                int h = (int)Bounds.Height;
-                if (w > 0 && h > 0)
-                {
-                    if (w != _lastWidth || h != _lastHeight)
-                    {
-                        MoveWindow(_childHwnd, 0, 0, w, h, true);
-                        _lastWidth = w;
-                        _lastHeight = h;
-                    }
-                    IntPtr unityHwnd = GetUnityHwnd();
-                    if (unityHwnd != IntPtr.Zero)
-                    {
-                        bool needsResize = true;
-                        if (GetWindowRect(unityHwnd, out RECT rect))
-                        {
-                            int actualWidth = rect.Right - rect.Left;
-                            int actualHeight = rect.Bottom - rect.Top;
-                            if (actualWidth == w && actualHeight == h)
-                            {
-                                needsResize = false;
-                            }
-                        }
+                return;
+            }
 
-                        if (needsResize)
-                        {
-                            MoveWindow(unityHwnd, 0, 0, w, h, true);
-                        }
-                        EnsureInputAttached(unityHwnd);
-                        KeepUnityFocus(unityHwnd);
+            int w = (int)Bounds.Width;
+            int h = (int)Bounds.Height;
+            if (w <= 0 || h <= 0)
+            {
+                return;
+            }
+
+            bool panelChanged = w != _lastWidth || h != _lastHeight;
+            if (panelChanged)
+            {
+                _pendingGameResize = false;
+                MoveWindow(_childHwnd, 0, 0, w, h, true);
+                _lastWidth = w;
+                _lastHeight = h;
+            }
+
+            IntPtr unityHwnd = GetUnityHwnd();
+            if (unityHwnd == IntPtr.Zero)
+            {
+                return;
+            }
+
+            if (GetWindowRect(unityHwnd, out RECT rect))
+            {
+                int gw = rect.Right - rect.Left;
+                int gh = rect.Bottom - rect.Top;
+
+                if (gw == w && gh == h)
+                {
+                    _gameSynced = true;
+                }
+                else if (_pendingGameResize)
+                {
+                    // Already requested launcher resize — wait for it to take effect
+                }
+                else if (_gameSynced && !panelChanged && gw > 0 && gh > 0)
+                {
+                    // Game changed its own resolution — resize the launcher window
+                    // so the panel matches the game's new size instead of snapping back.
+                    if (TopLevel.GetTopLevel(this) is Window topWindow
+                        && topWindow.WindowState != WindowState.Maximized)
+                    {
+                        _gameSynced = false;
+                        _pendingGameResize = true;
+                        topWindow.Width = topWindow.Bounds.Width + (gw - w);
+                        topWindow.Height = topWindow.Bounds.Height + (gh - h);
+                    }
+                    else
+                    {
+                        MoveWindow(unityHwnd, 0, 0, w, h, true);
                     }
                 }
+                else
+                {
+                    MoveWindow(unityHwnd, 0, 0, w, h, true);
+                }
             }
+
+            EnsureInputAttached(unityHwnd);
+            KeepUnityFocus(unityHwnd);
         }
 
         private void KeepUnityFocus(IntPtr unityHwnd)
@@ -571,6 +738,7 @@ namespace Launcher
                             // Sync Avalonia focus and Win32 focus
                             this.Focus();
                             SetFocus(unityHwnd);
+                            Trace.WriteLine($"[Input] click on game: focus was 0x{currentFocus.ToInt64():X}, SetFocus(game 0x{unityHwnd.ToInt64():X}) -> now 0x{GetGlobalFocusedWindow().ToInt64():X}");
                         }
                     }
                 }
@@ -590,7 +758,12 @@ namespace Launcher
             IntPtr unityHwnd = GetUnityHwnd();
             if (unityHwnd != IntPtr.Zero)
             {
-                SetFocus(unityHwnd);
+                IntPtr prev = SetFocus(unityHwnd);
+                Trace.WriteLine($"[Input] host got focus -> SetFocus(game 0x{unityHwnd.ToInt64():X}): prev=0x{prev.ToInt64():X} now=0x{GetFocus().ToInt64():X}");
+            }
+            else
+            {
+                Trace.WriteLine("[Input] host got focus but no game window yet");
             }
         }
 
@@ -617,16 +790,29 @@ namespace Launcher
                 _inputAttached = true;
                 _gameThreadId = gameThread;
                 _guiThreadId = guiThread;
+                Trace.WriteLine($"[Input] AttachThreadInput ok: launcher thread {guiThread} -> game thread {gameThread} (hwnd 0x{unityHwnd.ToInt64():X})");
                 // Give the game initial focus so the login field is typeable
                 // immediately; clicking launcher controls moves focus back.
-                SetFocus(unityHwnd);
+                IntPtr prev = SetFocus(unityHwnd);
+                Trace.WriteLine($"[Input] initial SetFocus(game): prev=0x{prev.ToInt64():X} now=0x{GetFocus().ToInt64():X}");
+            }
+            else if (!_attachFailureLogged)
+            {
+                // Retried every resize tick; log the first failure only.
+                _attachFailureLogged = true;
+                Trace.WriteLine($"[Input] AttachThreadInput FAILED (win32 error {Marshal.GetLastWin32Error()}): launcher thread {guiThread} -> game thread {gameThread}. Keystrokes will not reach the game.");
             }
         }
+
+        private bool _attachFailureLogged;
 
         protected override void DestroyNativeControlCore(IPlatformHandle control)
         {
             _resizeTimer?.Stop();
             _resizeTimer = null;
+
+            _macFollowTimer?.Stop();
+            _macFollowTimer = null;
 
             if (_inputAttached)
             {

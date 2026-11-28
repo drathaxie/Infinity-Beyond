@@ -83,5 +83,52 @@ namespace Launcher.ViewModels
             get;
             set => SetProperty(ref field, value);
         } = 1;
+        // Target monster names/ids, comma-separated ("Wyvern, 206"). Empty = any
+        // hostile in frame. Names let the same chain work on live AQW where the
+        // client never sees the server's kill-credit ids.
+        public string Mon
+        {
+            get;
+            set => SetProperty(ref field, value);
+        } = "";
+        // Farm entry: skipped by the story pass and looped after the chain is
+        // done. Saved under the chain's "farm" list rather than "entries".
+        public bool Farm
+        {
+            get;
+            set => SetProperty(ref field, value);
+        }
+    }
+
+    // One chain from a downloaded library script (Scripts/<File>.json).
+    public class LibraryScriptEntry
+    {
+        public string Name { get; set; } = "";
+        public string File { get; set; } = "";
+        public string FullPath { get; set; } = "";
+        public string Class { get; set; } = "";
+        public string Description { get; set; } = "";
+        public int Steps { get; set; }
+        public string Template { get; set; } = "quest-chain";
+        public int Choices { get; set; }
+        public int FarmSteps { get; set; }
+
+        public bool HasDescription => !string.IsNullOrWhiteSpace(Description);
+        public string Summary
+        {
+            get
+            {
+                string s = Template == "merge-shop" ? "Select merge rewards" : Choices > 0 ? $"{Choices} selectable targets" : $"{Steps} story steps";
+                if (FarmSteps > 0)
+                {
+                    s += $" · farms {FarmSteps} after";
+                }
+                if (!string.IsNullOrEmpty(Class))
+                {
+                    s += $" · class {Class}";
+                }
+                return s;
+            }
+        }
     }
 }

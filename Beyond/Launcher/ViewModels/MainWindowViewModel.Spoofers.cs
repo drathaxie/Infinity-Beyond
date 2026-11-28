@@ -53,6 +53,7 @@ namespace Launcher.ViewModels
 
         // --- Bundle / name fields ---
         [ObservableProperty] private string _spoofedName = "";
+        [ObservableProperty] private string _spoofedTitle = "";
         [ObservableProperty] private string _helmSpoofBundle = "";
         [ObservableProperty] private string _armorSpoofBundle = "";
         [ObservableProperty] private string _backSpoofBundle = "";
@@ -69,6 +70,13 @@ namespace Launcher.ViewModels
             // Name spoofing is always active: the mod renames whenever a non-empty
             // name is set, and clears it when blank. No enable toggle.
             _connection.SetSetting("spoofedName", SpoofedName);
+        }
+
+        [RelayCommand]
+        private void ApplySpoofedTitle()
+        {
+            // Cosmetic second nameplate line under the name; blank removes it.
+            _connection.SetSetting("spoofedTitle", SpoofedTitle);
         }
 
         [RelayCommand]

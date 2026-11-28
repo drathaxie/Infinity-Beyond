@@ -35,8 +35,11 @@ namespace BeyondAgent.Util
             public bool AnyNonAc;   // "*nonac" wildcard: matches any non-AC, non-gem item, ignoring name
         }
 
-        private static List<Entry> _keep = new();
-        private static List<Entry> _reject = new();
+        private static List<Entry> _keep = [];
+        private static List<Entry> _reject = [];
+        // Goal items of the running script (names / ids), looted on top of the
+        // user's own filter so a hunt never leaves its drops in the window.
+        private static List<Entry> _runnerKeep = [];
         private static bool _deleteOthers;
         private static readonly object _gate = new();
 
@@ -48,14 +51,15 @@ namespace BeyondAgent.Util
         // _sentLootIds = drops we've already sent a request for (skipped until the
         // server removes them from the loot list, i.e. confirms). _nextActionTime
         // is the earliest realtime we may send the next action.
-        private static readonly HashSet<int> _sentLootIds = new();
+        private static readonly HashSet<int> _sentLootIds = [];
+
         private static float _nextActionTime;
 
         // Set from the network thread when the server replies "Spam Detected";
         // consumed on the main thread in Tick (Unity's Time API is main-thread only).
         private static volatile bool _spamDetected;
 
-        private const float ActionDelaySeconds = 2.0f;
+        private const float ActionDelaySeconds = 2.0f;  // server flags loot actions sent too close together as spam; 2s is the tested-safe value
         private const float SpamBackoffSeconds = 8.0f;
 
         private static readonly HashSet<string> _knownRarities = new(System.StringComparer.OrdinalIgnoreCase)
@@ -84,13 +88,24 @@ namespace BeyondAgent.Util
             Diag($"ApplyDropFilter keep={keep.Count} reject={reject.Count} deleteOthers={deleteOthers} keepRaw=[{keepRaw}] rejectRaw=[{rejectRaw}]");
         }
 
+        /// <summary>Set (or clear, with an empty list) the QuestRunner's auto-loot items.</summary>
+        public static void SetRunnerKeep(IEnumerable<string> items)
+        {
+            List<Entry> keep = ParseEntries(string.Join(",", items ?? []));
+            lock (_gate)
+            {
+                _runnerKeep = keep;
+                _sentLootIds.Clear();
+            }
+        }
+
         /// <summary>Clear the filter.</summary>
         public static void ClearFilter()
         {
             lock (_gate)
             {
-                _keep = new();
-                _reject = new();
+                _keep = [];
+                _reject = [];
                 _deleteOthers = false;
                 _sentLootIds.Clear();
             }
@@ -116,7 +131,7 @@ namespace BeyondAgent.Util
         public static void Tick()
         {
             bool active;
-            lock (_gate) { active = _keep.Count > 0 || _reject.Count > 0 || _deleteOthers; }
+            lock (_gate) { active = _keep.Count > 0 || _reject.Count > 0 || _deleteOthers || _runnerKeep.Count > 0; }
             if (!active)
             {
                 return;
@@ -199,7 +214,7 @@ namespace BeyondAgent.Util
                 bool keep, reject;
                 lock (_gate)
                 {
-                    keep = MatchesAny(_keep, name, id, isGem, rarity, isAc);
+                    keep = MatchesAny(_keep, name, id, isGem, rarity, isAc) || MatchesAny(_runnerKeep, name, id, isGem, rarity, isAc);
                     if (keep)
                     {
                         reject = false;

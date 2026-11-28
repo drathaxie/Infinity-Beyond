@@ -35,9 +35,15 @@ namespace BeyondAgent
         private static int defaultAccessLevel = 0;
         private static string defaultPlayerName = "";
         private static string nameSpoofInput = "";
+        private static string titleSpoofInput = "";
         // Local name spoof is always active: a non-empty spoofedName means the
         // nameplate/HUD/chat patches substitute it; blank means no spoof.
         public static string spoofedName = "";
+        // Local title spoof: substituted into the nameplate's own title slot
+        // (NameplateView.titleText) in place of Player.Title; blank means the
+        // real title. Never sent — RequestSavePlayerTitle takes the title the
+        // character panel picked, not Player.Title.
+        public static string spoofedTitle = "";
         private static int defaultTargetFrameRate = -2;
 
         // "Fun" window — home for visual/local spoofers (name, gear, future).
@@ -93,7 +99,7 @@ namespace BeyondAgent
 
         // Jukebox: play any soundtrack by ID (typically 1..318). Dropdown is
         // populated passively by MusicHarvestPatch — every track the game
-        // registers with BGMusicManager (area BGM, cutscene stings, our own
+        // registers with Music (area BGM, cutscene stings, our own
         // loads) lands in MusicCatalog and shows up here.
         private static string jukeboxInput = "";
         private static int jukeboxSelectedId = 0;
@@ -385,6 +391,8 @@ namespace BeyondAgent
             ItemCatalog.Init();
             MusicCatalog.Init();
             QuestChains.Init();
+            QuestDB.Init();
+            questRunner.OnProgressChanged = SendQuestRunnerState;
 
             string userDir = System.IO.Path.Combine(BeyondEnv.UserDataDirectory, "Beyond");
             System.IO.Directory.CreateDirectory(userDir);
@@ -528,6 +536,12 @@ namespace BeyondAgent
                 }
             }
             try { ProcessLauncherCommands(); } catch (System.Exception ex) { BeyondLog.Error($"ProcessLauncherCommands error: {ex}"); }
+            // macOS overlay-follow: re-evaluate frontmost-app gating so the floating
+            // game window hides promptly when the user switches to an unrelated app.
+            try { Util.MacEmbed.Tick(); } catch (System.Exception ex) { BeyondLog.Error($"MacEmbed tick: {ex.Message}"); }
+            // macOS: quit the game if the launcher process is gone (no Job Object
+            // equivalent on mac, so nothing else reaps an orphaned game window).
+            try { Util.ParentWatchdog.Tick(); } catch (System.Exception ex) { BeyondLog.Error($"ParentWatchdog tick: {ex.Message}"); }
             // Tick the quest runner every frame. It's a no-op when Idle/Done/Failed.
             try { questRunner?.Tick(); } catch (System.Exception ex) { BeyondLog.Error($"QuestRunner tick: {ex.Message}"); }
 
@@ -565,6 +579,15 @@ namespace BeyondAgent
                     if (Input.GetKeyDown(KeyCode.P)) { HudToggles.HideOtherPlayers = !HudToggles.HideOtherPlayers; BeyondLog.Msg($"[Hotkey] HideOtherPlayers={HudToggles.HideOtherPlayers}"); }
                     if (Input.GetKeyDown(KeyCode.M)) { HudToggles.HideMonsters = !HudToggles.HideMonsters; BeyondLog.Msg($"[Hotkey] HideMonsters={HudToggles.HideMonsters}"); }
                     if (Input.GetKeyDown(KeyCode.N)) { HudToggles.HideNPCs = !HudToggles.HideNPCs; BeyondLog.Msg($"[Hotkey] HideNPCs={HudToggles.HideNPCs}"); }
+                    // H expands/collapses the hitbox readout. Only while the
+                    // overlay is up, so the key stays free otherwise; the status
+                    // push keeps the launcher's Debug window in sync.
+                    if (HitboxOverlay.Enabled && Input.GetKeyDown(KeyCode.H))
+                    {
+                        HitboxOverlay.Expanded = !HitboxOverlay.Expanded;
+                        BeyondLog.Msg($"[Hotkey] HitboxReadoutExpanded={HitboxOverlay.Expanded}");
+                        SendStatusUpdate();
+                    }
                 }
             }
             catch (System.Exception ex) { BeyondLog.Error($"HudToggles hotkey: {ex.Message}"); }
@@ -750,6 +773,11 @@ namespace BeyondAgent
 
         public void OnGUI()
         {
+            // Debug hitbox overlay — drawn before the IMGUI menu gate, since the
+            // standalone build never enables that menu (useImgui stays false) but
+            // still needs the overlay. Self-guarded: no-op when toggled off.
+            try { HitboxOverlay.Draw(); } catch (System.Exception ex) { BeyondLog.Error($"HitboxOverlay draw: {ex.Message}"); }
+
             if (!useImgui)
             {
                 return;
@@ -2594,6 +2622,7 @@ namespace BeyondAgent
                             Entity.mainPlayer.AccessLevel = defaultAccessLevel;
                             Entity.mainPlayer.updateNameColor();
                             ClearNameSpoof();
+                            ApplyTitleSpoof("");
                             BeyondLog.Msg($"Reset player defaults: Name={defaultPlayerName}, UpgradeDays={defaultUpgradeDays}, AccessLevel={defaultAccessLevel}");
                         }
                         else
@@ -2634,30 +2663,37 @@ namespace BeyondAgent
 
             float curY = 35f;
 
-            // 1. Name Spoof — local-only nameplate/HUD/chat substitution.
+            // 1. Name + title spoof — local-only nameplate/HUD/chat substitution.
             GUI.Label(new Rect(pad, curY, innerW, 20), "Name Spoof:", labelStyle);
             curY += 20f;
             nameSpoofInput = GUI.TextField(new Rect(pad, curY, innerW, 30), nameSpoofInput, textFieldStyle);
             curY += 35f;
+            GUI.Label(new Rect(pad, curY, innerW, 20), "Title Spoof:", labelStyle);
+            curY += 20f;
+            titleSpoofInput = GUI.TextField(new Rect(pad, curY, innerW, 30), titleSpoofInput, textFieldStyle);
+            curY += 35f;
 
             const float btnW = (innerW - 10) / 2f;
+            bool spoofActive = !string.IsNullOrEmpty(spoofedName) || !string.IsNullOrEmpty(spoofedTitle);
             if (playerExists)
             {
-                if (GUI.Button(new Rect(pad, curY, btnW, 30), !string.IsNullOrEmpty(spoofedName) ? "Update Name" : "Apply Name", closeButtonStyle))
+                if (GUI.Button(new Rect(pad, curY, btnW, 30), spoofActive ? "Update" : "Apply", closeButtonStyle))
                 {
                     ApplyNameSpoof(nameSpoofInput);
+                    ApplyTitleSpoof(titleSpoofInput);
                 }
 
-                if (GUI.Button(new Rect(pad + btnW + 10, curY, btnW, 30), "Clear Name", closeButtonStyle))
+                if (GUI.Button(new Rect(pad + btnW + 10, curY, btnW, 30), "Clear", closeButtonStyle))
                 {
                     ClearNameSpoof();
+                    ApplyTitleSpoof("");
                 }
             }
             else
             {
                 GUI.enabled = false;
-                GUI.Button(new Rect(pad, curY, btnW, 30), "Apply Name", closeButtonStyle);
-                GUI.Button(new Rect(pad + btnW + 10, curY, btnW, 30), "Clear Name", closeButtonStyle);
+                GUI.Button(new Rect(pad, curY, btnW, 30), "Apply", closeButtonStyle);
+                GUI.Button(new Rect(pad + btnW + 10, curY, btnW, 30), "Clear", closeButtonStyle);
                 GUI.enabled = true;
             }
             curY += 40f;
@@ -2761,7 +2797,7 @@ namespace BeyondAgent
                 ref monTransformInput, monTransformActive,
                 ApplyMonTransformSpoof, ClearMonTransformSpoof);
 
-            // Jukebox — play any soundtrack by ID. Loads via SoundtrackLoader
+            // Jukebox — play any soundtrack by ID. Loads via Music.Load
             // (data/getsoundtracks?ids=<id>) on first request, cached after.
             // Known tracks come from MusicCatalog (harvested passively).
             int namedCount = MusicCatalog.Tracks.Values.Count(t => !string.IsNullOrEmpty(t.name));
@@ -3416,6 +3452,24 @@ namespace BeyondAgent
             BeyondLog.Msg("Cleared local nameplate spoof.");
         }
 
+        private static void ApplyTitleSpoof(string desiredTitle)
+        {
+            desiredTitle = (desiredTitle ?? "").Trim();
+            if (desiredTitle.Length > 24)
+            {
+                desiredTitle = desiredTitle[..24];
+            }
+
+            spoofedTitle = desiredTitle;
+            titleSpoofInput = desiredTitle;
+            // No mainPlayer guard: the launcher can set this before login and
+            // createNameplate picks it up when the player spawns.
+            try { Entity.mainPlayer?.RefreshNameplate(); } catch { }
+            BeyondLog.Msg(desiredTitle.Length == 0
+                ? "Cleared local title spoof."
+                : $"Set local title spoof to '{desiredTitle}'.");
+        }
+
         private void DrawShopLoaderWindow(int windowID)
         {
             const float winWidth = 280f;
@@ -3759,7 +3813,8 @@ namespace BeyondAgent
                         questRunnerLogScroll.y = float.MaxValue;
                     }
                 };
-                questRunner.StartChain(currentChainName, QuestChains.Get(currentChainName));
+                questRunner.StartChain(currentChainName, QuestChains.Get(currentChainName),
+                    QuestChains.GetFarm(currentChainName), 0, QuestChains.GetBuy(currentChainName));
             }
             GUI.enabled = true;
 
@@ -3875,7 +3930,8 @@ namespace BeyondAgent
                               area = e.area,
                               frame = e.frame,
                               pad = e.pad,
-                              items = e.items
+                              items = e.items,
+                              mons = [.. e.mons]
                           }) :
                           [];
                 errorMsg = null;
@@ -3944,7 +4000,7 @@ namespace BeyondAgent
             y += 22f;
 
             // ---- Entries header ----
-            GUI.Label(new Rect(p, y, W - (p * 2), 18), "Entries:   qid | area | frame | pad | iters | -", labelStyle);
+            GUI.Label(new Rect(p, y, W - (p * 2), 18), "Entries:   qid | area | frame | pad | iters | mon (names/ids, comma) | -", labelStyle);
             y += 20f;
 
             // ---- Entries scroll list ----
@@ -3962,7 +4018,8 @@ namespace BeyondAgent
                 string sframe = GUI.TextField(new Rect(140, ey, 68, 26), ent.frame ?? "", textFieldStyle); ent.frame = sframe;
                 string spad = GUI.TextField(new Rect(214, ey, 58, 26), ent.pad ?? "Spawn", textFieldStyle); ent.pad = spad;
                 string sitems = GUI.TextField(new Rect(278, ey, 38, 26), ent.items.ToString(), textFieldStyle); int.TryParse(sitems, out int itemsval); ent.items = itemsval < 1 ? 1 : itemsval;
-                if (GUI.Button(new Rect(322, ey, 28, 26), "-", closeButtonStyle)) { _chainEditState.entries.RemoveAt(i); break; }
+                string smon = GUI.TextField(new Rect(322, ey, 140, 26), ent.MonText, textFieldStyle); ent.MonText = smon;
+                if (GUI.Button(new Rect(468, ey, 28, 26), "-", closeButtonStyle)) { _chainEditState.entries.RemoveAt(i); break; }
                 _chainEditState.entries[i] = ent;
             }
             if (GUI.Button(new Rect(0, _chainEditState.entries.Count * 32f, 28, 26), "+", closeButtonStyle))
@@ -4051,7 +4108,29 @@ namespace BeyondAgent
 
                 // Read existing user file as JObject so we preserve unknown keys / comments
                 JObject root = System.IO.File.Exists(chainFile) ? Newtonsoft.Json.Linq.JObject.Parse(System.IO.File.ReadAllText(chainFile)) : [];
-                root[nm] = EntriesToJArray(_chainEditState.entries);
+                // This editor only edits the story entries — carry over the
+                // chain's class and farm list (from any source) so a save here
+                // doesn't silently drop them.
+                QuestChains.Classes.TryGetValue(nm, out string keepClass);
+                List<QuestChains.Entry> keepFarm = QuestChains.GetFarm(nm);
+                if (!string.IsNullOrEmpty(keepClass) || keepFarm != null)
+                {
+                    JObject chain = [];
+                    if (!string.IsNullOrEmpty(keepClass))
+                    {
+                        chain["class"] = keepClass;
+                    }
+                    chain["entries"] = EntriesToJArray(_chainEditState.entries);
+                    if (keepFarm != null)
+                    {
+                        chain["farm"] = EntriesToJArray(keepFarm);
+                    }
+                    root[nm] = chain;
+                }
+                else
+                {
+                    root[nm] = EntriesToJArray(_chainEditState.entries);
+                }
                 System.IO.File.WriteAllText(chainFile,
                     root.ToString(Newtonsoft.Json.Formatting.Indented));
 
@@ -4205,6 +4284,10 @@ namespace BeyondAgent
                     ["pad"] = string.IsNullOrEmpty(ent.pad) ? "Spawn" : ent.pad,
                     ["items"] = ent.items < 1 ? 1 : ent.items
                 };
+                if (ent.mons.Count > 0)
+                {
+                    o["mon"] = new JArray(ent.mons);
+                }
                 arr.Add(o);
             }
             return arr;
@@ -4670,6 +4753,7 @@ namespace BeyondAgent
         {
             Dictionary<string, object> settings = new()
             {
+                { "monsterFarmingProtocol", 1 },
                 { "playerAccessLevel", (Entity.mainPlayer?.AccessLevel) ?? 0 },
                 { "playerUpgradeDays", (Entity.mainPlayer?.UpgradeDays) ?? 0 },
                 { "isMember", Entity.mainPlayer?.UpgradeDays > 0 },
@@ -4703,6 +4787,8 @@ namespace BeyondAgent
                 { "hideOtherPlayers", HudToggles.HideOtherPlayers },
                 { "hideMonsters", HudToggles.HideMonsters },
                 { "hideNPCs", HudToggles.HideNPCs },
+                { "hitboxOverlay", HitboxOverlay.Enabled },
+                { "hitboxReadoutExpanded", HitboxOverlay.Expanded },
                 { "skillsetEditCombo", skillsetEditCombo },
                 { "skillsetEditName", skillsetEditName },
                 { "skillsetFileInput", skillsetFileInput },
@@ -4721,6 +4807,70 @@ namespace BeyondAgent
             };
 
             LauncherServer.Send(payload);
+        }
+
+        private static List<object> ChainEntriesForLauncher(List<QuestChains.Entry> list)
+        {
+            List<object> entries = [];
+            foreach (QuestChains.Entry e in list)
+            {
+                entries.Add(new
+                {
+                    e.qid,
+                    area = e.area ?? "",
+                    frame = e.frame ?? "",
+                    pad = e.pad ?? "Spawn",
+                    e.items,
+                    mon = e.mons
+                });
+            }
+            return entries;
+        }
+
+        // Fresh log for a launcher-started run, mirrored to both the in-game
+        // runner window and the launcher's Quest Runner log.
+        private static void WireQuestRunnerLogToLauncher()
+        {
+            questRunnerLog.Clear();
+            questRunner.OnLog = line =>
+            {
+                string formatted = $"{System.DateTime.Now:HH:mm:ss}  {line}";
+                lock (questRunnerLog)
+                {
+                    questRunnerLog.Add(formatted);
+                    if (questRunnerLog.Count > 200)
+                    {
+                        questRunnerLog.RemoveAt(0);
+                    }
+                    questRunnerLogScroll.y = float.MaxValue;
+                }
+                LauncherServer.Send(new { Type = "QuestRunnerLog", Message = formatted });
+            };
+        }
+
+        // Runner progress for the launcher's Start/Stop controls and status
+        // line. Sent on start/stop/advance and with every catalog push.
+        private static void SendQuestRunnerState()
+        {
+            QuestRunner r = questRunner;
+            LauncherServer.Send(new
+            {
+                Type = "QuestRunnerState",
+                Running = r.IsRunning,
+                Paused = r.IsPaused,
+                State = r.State.ToString(),
+                Chain = r.ChainEntries != null ? r.ChainName : "",
+                Farming = r.IsFarming,
+                r.Phase,
+                Goal = r.GoalProgress,
+                Index = r.ChainIndex,
+                Count = r.ChainEntries?.Count ?? 0,
+                FarmPass = r.FarmPass,
+                FarmLoops = r.FarmLoops,
+                r.QuestID,
+                r.StatusLine,
+                r.LastError
+            });
         }
 
         public void SendCatalogs()
@@ -4769,36 +4919,31 @@ namespace BeyondAgent
 
                 // Send Quest Chains
                 Dictionary<string, List<object>> chainsDict = [];
+                Dictionary<string, List<object>> chainFarms = [];
+                Dictionary<string, string> chainClasses;
+                Dictionary<string, string> chainSources;
                 lock (QuestChains.All)
                 {
                     foreach (KeyValuePair<string, List<QuestChains.Entry>> kv in QuestChains.All)
                     {
-                        List<object> entries = [];
-                        foreach (QuestChains.Entry e in kv.Value)
-                        {
-                            entries.Add(new
-                            {
-                                e.qid,
-                                area = e.area ?? "",
-                                frame = e.frame ?? "",
-                                pad = e.pad ?? "Spawn",
-                                e.items
-                            });
-                        }
-                        chainsDict[kv.Key] = entries;
+                        chainsDict[kv.Key] = ChainEntriesForLauncher(kv.Value);
                     }
-                }
-                Dictionary<string, string> chainClasses;
-                lock (QuestChains.All)
-                {
+                    foreach (KeyValuePair<string, List<QuestChains.Entry>> kv in QuestChains.Farms)
+                    {
+                        chainFarms[kv.Key] = ChainEntriesForLauncher(kv.Value);
+                    }
                     chainClasses = new Dictionary<string, string>(QuestChains.Classes);
+                    chainSources = new Dictionary<string, string>(QuestChains.Sources);
                 }
                 LauncherServer.Send(new
                 {
                     Type = "QuestChains",
                     Chains = chainsDict,
-                    ChainClasses = chainClasses
+                    ChainClasses = chainClasses,
+                    ChainFarms = chainFarms,
+                    ChainSources = chainSources
                 });
+                SendQuestRunnerState();
 
                 // Send Item Catalog
                 List<object> helmsList = [];
@@ -4915,6 +5060,9 @@ namespace BeyondAgent
                                 // renames immediately; blank clears it.
                                 spoofedName = (string)val;
                                 ApplyNameSpoof(spoofedName);
+                                break;
+                            case "spoofedTitle":
+                                ApplyTitleSpoof((string)val);
                                 break;
                             case "helmSpoofActive": helmSpoofActive = (bool)val; break;
                             case "helmSpoofBundle": helmSpoofBundle = (string)val; break;
@@ -5033,9 +5181,23 @@ namespace BeyondAgent
                             case "hideOtherPlayers": HudToggles.HideOtherPlayers = (bool)val; break;
                             case "hideMonsters": HudToggles.HideMonsters = (bool)val; break;
                             case "hideNPCs": HudToggles.HideNPCs = (bool)val; break;
+                            case "hitboxOverlay": HitboxOverlay.Enabled = (bool)val; break;
+                            case "hitboxReadoutExpanded": HitboxOverlay.Expanded = (bool)val; break;
                         }
 
                         SendStatusUpdate();
+                    }
+                    else if (type == "MacEmbed")
+                    {
+                        // macOS overlay-follow embedding: reposition the game's own
+                        // NSWindow over the launcher's tab panel. Runs on the Unity
+                        // main thread (== AppKit main thread), as AppKit requires.
+                        BeyondAgent.Util.MacEmbed.Apply(
+                            (double)cmd["X"],
+                            (double)cmd["Y"],
+                            (double)cmd["W"],
+                            (double)cmd["H"],
+                            (bool)cmd["Visible"]);
                     }
                     else if (type == "SkipCutscene")
                     {
@@ -5059,6 +5221,14 @@ namespace BeyondAgent
                         }
                     }
 
+                    else if (type == "RequestFarmingMonsters")
+                    {
+                        MonsterFarmingCatalog.SendMonsters();
+                    }
+                    else if (type == "RequestFarmingDrops")
+                    {
+                        MonsterFarmingCatalog.RequestDrops((int?)cmd["MonsterId"] ?? 0);
+                    }
                     else if (type == "LoadShop")
                     {
                         int shopId = (int)cmd["ShopId"];
@@ -5156,22 +5326,7 @@ namespace BeyondAgent
                         string frame = (string)cmd["Frame"];
                         string pad = (string)cmd["Pad"];
 
-                        questRunnerLog.Clear();
-                        questRunner.OnLog = line =>
-                        {
-                            string formatted = $"{System.DateTime.Now:HH:mm:ss}  {line}";
-                            lock (questRunnerLog)
-                            {
-                                questRunnerLog.Add(formatted);
-                                if (questRunnerLog.Count > 200)
-                                {
-                                    questRunnerLog.RemoveAt(0);
-                                }
-                                questRunnerLogScroll.y = float.MaxValue;
-                            }
-                            LauncherServer.Send(new { Type = "QuestRunnerLog", Message = formatted });
-                        };
-
+                        WireQuestRunnerLogToLauncher();
                         questRunner?.Start(qid, iters, area, frame, pad);
                     }
                     else if (type == "StopQuestRunner")
@@ -5271,7 +5426,9 @@ namespace BeyondAgent
                                 Entity.mainPlayer.UpgradeDays = defaultUpgradeDays;
                                 Entity.mainPlayer.updateNameColor();
                                 spoofedName = "";
+                                spoofedTitle = "";
                                 nameSpoofInput = defaultPlayerName ?? "";
+                                titleSpoofInput = "";
                                 Entity.mainPlayer.RefreshNameplate();
                                 BeyondLog.Msg($"[Launcher] Reset player defaults: Name={defaultPlayerName}, UpgradeDays={defaultUpgradeDays}, AccessLevel={defaultAccessLevel}");
                             }
@@ -5593,13 +5750,23 @@ namespace BeyondAgent
                                     // doesn't specify one (e.g. chain editor re-save).
                                     cls = (string)existingChain["class"];
                                 }
-                                if (!string.IsNullOrEmpty(cls))
+                                // Same for the farm list: absent = keep what's on
+                                // disk; present (even empty) = replace it.
+                                JArray farm = cmd["Farm"] as JArray
+                                    ?? (root[name] as JObject)?["farm"] as JArray;
+                                if (!string.IsNullOrEmpty(cls) || farm is { Count: > 0 })
                                 {
-                                    root[name] = new JObject
+                                    JObject chain = [];
+                                    if (!string.IsNullOrEmpty(cls))
                                     {
-                                        ["class"] = cls,
-                                        ["entries"] = entries
-                                    };
+                                        chain["class"] = cls;
+                                    }
+                                    chain["entries"] = entries;
+                                    if (farm is { Count: > 0 })
+                                    {
+                                        chain["farm"] = farm.DeepClone();
+                                    }
+                                    root[name] = chain;
                                 }
                                 else
                                 {
@@ -5644,23 +5811,9 @@ namespace BeyondAgent
                     else if (type == "RunChain")
                     {
                         string name = (string)cmd["Name"];
-                        if (!string.IsNullOrEmpty(name))
+                        if (!string.IsNullOrEmpty(name) && !questRunner.IsRunning)
                         {
-                            questRunnerLog.Clear();
-                            questRunner.OnLog = line =>
-                            {
-                                string formatted = $"{System.DateTime.Now:HH:mm:ss}  {line}";
-                                lock (questRunnerLog)
-                                {
-                                    questRunnerLog.Add(formatted);
-                                    if (questRunnerLog.Count > 200)
-                                    {
-                                        questRunnerLog.RemoveAt(0);
-                                    }
-                                    questRunnerLogScroll.y = float.MaxValue;
-                                }
-                                LauncherServer.Send(new { Type = "QuestRunnerLog", Message = formatted });
-                            };
+                            WireQuestRunnerLogToLauncher();
                             // Optional class/skillset chosen on the chain tab — apply it
                             // (forcing the combo live) before the run begins.
                             string skillsetName = (string)cmd["Skillset"];
@@ -5672,8 +5825,65 @@ namespace BeyondAgent
                                     SendStatusUpdate();
                                 }
                             }
-                            questRunner?.StartChain(name, QuestChains.Get(name));
+                            // Farm phase: on unless the launcher says otherwise
+                            // (older launchers don't send the flag).
+                            bool farm = (bool?)cmd["Farm"] ?? true;
+                            int farmLoops = (int?)cmd["FarmLoops"] ?? 0;
+                            questRunner?.StartChain(name, QuestChains.Get(name),
+                                farm ? QuestChains.GetFarm(name) : null, farmLoops, QuestChains.GetBuy(name));
                         }
+                    }
+                    else if (type == "RunScript")
+                    {
+                        // A script file loaded in the launcher's Load Script window,
+                        // sent inline — runs without being in any chain catalog.
+                        string name = (string)cmd["Name"] ?? "Script";
+                        List<QuestChains.Entry> entries = cmd["Entries"] is JArray ea ? QuestChains.ParseEntries(ea) : [];
+                        List<QuestChains.Entry> farm = cmd["Farm"] is JArray fa ? QuestChains.ParseEntries(fa) : null;
+                        QuestChains.BuyPlan buy = QuestChains.BuyPlan.Parse(cmd["Buy"]);
+                        BeyondLog.Msg($"[Launcher] RunScript '{name}': {entries.Count} entries, {farm?.Count ?? 0} farm, buy={(buy != null ? buy.shop.ToString() : "none")}, runner {questRunner.State}");
+                        string refusal = questRunner.IsRunning ? "a script is already running"
+                            : entries.Count == 0 && farm is not { Count: > 0 } && buy == null ? "the script has no steps (quests need qid > 0, hunts need \"hunt\")"
+                            : null;
+                        if (refusal != null)
+                        {
+                            LauncherServer.Send(new { Type = "QuestRunnerLog", Message = $"{System.DateTime.Now:HH:mm:ss}  [refused] {refusal}" });
+                        }
+                        else
+                        {
+                            WireQuestRunnerLogToLauncher();
+                            string skillsetName = (string)cmd["Skillset"];
+                            if (!string.IsNullOrEmpty(skillsetName))
+                            {
+                                int si = savedSkillsets.FindIndex(s => s.Name.Equals(skillsetName, System.StringComparison.OrdinalIgnoreCase));
+                                if (si >= 0 && ApplySkillset(si, forceCombo: true))
+                                {
+                                    SendStatusUpdate();
+                                }
+                            }
+                            bool farmOn = (bool?)cmd["FarmEnabled"] ?? true;
+                            int farmLoops = (int?)cmd["FarmLoops"] ?? 0;
+                            // Farm-only scripts (no story entries) always farm.
+                            questRunner.StartChain(name, entries,
+                                farmOn || entries.Count == 0 ? farm : null, farmLoops, buy);
+                        }
+                    }
+                    else if (type == "PauseQuestRunner")
+                    {
+                        questRunner.Pause();
+                    }
+                    else if (type == "ResumeQuestRunner")
+                    {
+                        questRunner.Resume();
+                    }
+                    else if (type == "ReloadLibrary")
+                    {
+                        // The launcher just (re)downloaded Infinity-Files: pick up
+                        // new/changed scripts and autoskills without a restart.
+                        QuestChains.Init();
+                        LoadLibrarySkillsets();
+                        SendStatusUpdate();
+                        SendCatalogs();
                     }
                     else if (type == "ApplyDropFilter")
                     {
